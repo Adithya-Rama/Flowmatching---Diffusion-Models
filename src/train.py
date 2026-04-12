@@ -82,8 +82,11 @@ def flow_matching_loss(
         loss = nn.functional.mse_loss(x_hat, x_target)
 
     elif pred_type == "x" and loss_type == "v":
-        # Model predicts x;  convert to v̂ = (z_t − x̂) / t  and compute v-loss
-        v_hat = (z_t - pred) / t4.clamp(min=t_eps)
+        # Model predicts x;  convert to v̂ = (z_t − x̂) / t  and compute v-loss.
+        # Use a generous t floor (≥0.05) for this division: at t=1e-4 the raw 1/t²
+        # weight reaches ~10^8, causing catastrophic loss spikes (see §2.2 analysis).
+        _t_xv = t4.clamp(min=max(t_eps, 0.05))
+        v_hat = (z_t - pred) / _t_xv
         loss = nn.functional.mse_loss(v_hat, v_target)
 
     elif pred_type == "x" and loss_type == "x":

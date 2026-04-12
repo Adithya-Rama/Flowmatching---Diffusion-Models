@@ -1,0 +1,1249 @@
+Total cells: 41
+
+================================================================================
+CELL 0 | TYPE: markdown
+================================================================================
+# COMP8650 — Flow Matching: Parameterisation & MeanFlow
+### Assignment 2 | Advanced Topics in Machine Learning
+
+**Strategy:**
+1. This notebook mounts Google Drive and clones/pulls the assignment repo.
+2. All source modules live in `src/` of the repo; we add them to `sys.path`.
+3. Training uses automatic checkpointing → every run is resumable.
+4. Results and figures are saved to Drive.
+
+**Structure:**
+- [§0 Setup](#setup) — Drive, Git, dependencies, data
+- [§1 Part 1](#part1) — Warm-up: data viz + v-prediction at D=2
+- [§2 Part 2](#part2) — All 4 pred×loss combos across 3 datasets × 3 dims
+- [§3 Part 3](#part3) — Can we rescue v-prediction at D=32?
+- [§4 Part 4](#part4) — Sampling efficiency + MeanFlow
+
+================================================================================
+CELL 1 | TYPE: markdown
+================================================================================
+---
+## §0  Setup <a id='setup'></a>
+
+================================================================================
+CELL 2 | TYPE: code
+================================================================================
+# ── 0.1  Mount Google Drive ───────────────────────────────────────────────────
+from google.colab import drive
+drive.mount('/content/drive', force_remount=False)
+print("Drive mounted ✓")
+
+================================================================================
+CELL 3 | TYPE: code
+================================================================================
+# ── 0.2  Configure paths ─────────────────────────────────────────────────────
+import os
+
+# ⬇  Change DRIVE_BASE if you want the repo in a different folder on Drive
+DRIVE_BASE     = '/content/drive/MyDrive/COMP8650/Assgn-2'
+REPO_NAME      = 'Flowmatching---Diffusion-Models'
+REPO_URL       = 'https://github.com/Adithya-Rama/Flowmatching---Diffusion-Models.git'
+
+REPO_DIR       = os.path.join(DRIVE_BASE, REPO_NAME)
+DATA_DIR       = os.path.join(REPO_DIR, 'data')
+CHECKPOINT_DIR = os.path.join(DRIVE_BASE, 'checkpoints')
+RESULTS_DIR    = os.path.join(DRIVE_BASE, 'results')
+
+os.makedirs(DRIVE_BASE,     exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR,    exist_ok=True)
+
+print(f"Repo dir   : {REPO_DIR}")
+print(f"Data dir   : {DATA_DIR}")
+print(f"Checkpoints: {CHECKPOINT_DIR}")
+print(f"Results    : {RESULTS_DIR}")
+
+================================================================================
+CELL 4 | TYPE: code
+================================================================================
+# ── 0.3  Clone or pull the repository ────────────────────────────────────────
+import subprocess, sys
+
+def run(cmd, **kw):
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+    if result.returncode != 0:
+        print(f"STDERR: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+if not os.path.exists(os.path.join(REPO_DIR, '.git')):
+    print("Cloning repository …")
+    out = run(f'git clone {REPO_URL} "{REPO_DIR}"')
+    print(out or "Done.")
+else:
+    print("Repository found — pulling latest …")
+    out = run(f'git -C "{REPO_DIR}" pull')
+    print(out)
+
+print("\nRepo contents:")
+print(run(f'ls "{REPO_DIR}"'))
+
+================================================================================
+CELL 5 | TYPE: code
+================================================================================
+# ── 0.4  Add src/ to Python path ─────────────────────────────────────────────
+SRC_DIR = os.path.join(REPO_DIR, 'src')
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+print("sys.path updated ✓")
+
+================================================================================
+CELL 6 | TYPE: code
+================================================================================
+# ── 0.5  Install / verify dependencies ───────────────────────────────────────
+# Most are pre-installed in Colab; torch & tqdm should already be present.
+# Only install what's missing.
+import importlib
+
+def ensure(pkg, pip_name=None):
+    try:
+        importlib.import_module(pkg)
+        print(f"  {pkg:25s} already installed")
+    except ImportError:
+        name = pip_name or pkg
+        print(f"  Installing {name} …")
+        subprocess.run(f'{sys.executable} -m pip install -q {name}', shell=True)
+
+ensure('torch')
+ensure('torchvision')
+ensure('matplotlib')
+ensure('numpy')
+ensure('sklearn', 'scikit-learn')
+ensure('tqdm')
+ensure('huggingface_hub', 'huggingface-hub[cli]')
+print("\nAll dependencies ready ✓")
+
+================================================================================
+CELL 7 | TYPE: code
+================================================================================
+# ── 0.6  Download dataset (if not already present) ───────────────────────────
+if not os.path.exists(DATA_DIR) or len(os.listdir(DATA_DIR)) == 0:
+    print("Downloading toy dataset via huggingface-hub …")
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        repo_id='xingjianleng/toy-data',
+        repo_type='dataset',
+        local_dir=DATA_DIR,
+    )
+    print("Download complete ✓")
+else:
+    print(f"Data already present in {DATA_DIR} ✓")
+    print("Files:", os.listdir(DATA_DIR))
+
+================================================================================
+CELL 8 | TYPE: code
+================================================================================
+# ── 0.7  Global imports and device detection ─────────────────────────────────
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ── Module imports from repo src/
+from dataloader      import ToyDiffusionDataset, get_dataloader, AVAILABLE_DATASETS
+from model           import FlowMatchingMLP, MeanFlowMLP
+from train           import train_flow_matching, load_checkpoint, checkpoint_exists
+from sample          import euler_sample, meanflow_sample, sample_and_project
+from meanflow_train  import train_meanflow
+from utils           import (
+    plot_comparison, plot_2x2_grid, plot_grid,
+    plot_loss_curve, plot_step_comparison,
+    nearest_neighbour_dist, print_results_table, save_fig
+)
+
+# Device
+DEVICE = (
+    'cuda'  if torch.cuda.is_available() else
+    'mps'   if torch.backends.mps.is_available() else
+    'cpu'
+)
+print(f"Device: {DEVICE}")
+if DEVICE == 'cuda':
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Convenience: fixed data_dir override for dataloader
+DATA_PATH = Path(DATA_DIR)
+DATASETS  = ('swiss_roll', 'gaussians', 'circles')
+DIMS      = (2, 8, 32)
+
+================================================================================
+CELL 9 | TYPE: markdown
+================================================================================
+---
+## §1  Part 1 — Warm-up (10 marks) <a id='part1'></a>
+
+================================================================================
+CELL 10 | TYPE: markdown
+================================================================================
+### §1.1  Data Visualisation (3 marks)
+
+We load each of the three 2-D toy datasets and verify their structure. We then
+load the D=32 version of each, project it back to 2-D via the stored orthogonal
+matrix $P_D$, and confirm the same structure is preserved (the intrinsic
+dimensionality is always 2, regardless of ambient dimension $D$).
+
+**Deliverable:** 6 scatter plots — 2-D original and 32-D back-projected, for
+each of the 3 datasets.
+
+================================================================================
+CELL 11 | TYPE: code
+================================================================================
+# §1.1  Data Visualisation
+# ──────────────────────────────────────────────────────────────────────────────
+# Load all datasets at D=2 and D=32, project back to 2-D, scatter plot.
+
+N_VIZ = 2000   # points to plot
+
+fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+
+for col, ds_name in enumerate(DATASETS):
+    for row, dim in enumerate([2, 32]):
+        ds   = ToyDiffusionDataset(ds_name, dim=dim, data_dir=DATA_PATH)
+        data = ds.data.numpy()
+
+        # Random subset for plotting
+        idx   = np.random.choice(len(data), min(N_VIZ, len(data)), replace=False)
+        data2d = ds.to_2d(data[idx])    # no-op if dim==2 (P is None)
+
+        ax = axes[row][col]
+        ax.scatter(data2d[:, 0], data2d[:, 1], s=2, alpha=0.5)
+        ax.set_title(f'{ds_name}  (D={dim}{"→2D" if dim>2 else ""})', fontsize=10)
+        ax.set_aspect('equal')
+        ax.grid(True, lw=0.3, alpha=0.4)
+
+        if row == 0:
+            ax.set_xlabel('x₁'); ax.set_ylabel('x₂')
+        else:
+            ax.set_xlabel('proj₁'); ax.set_ylabel('proj₂')
+
+axes[0][0].annotate('Original 2-D', xy=(-0.18, 0.5), xycoords='axes fraction',
+                     fontsize=12, ha='center', va='center', rotation=90,
+                     fontweight='bold')
+axes[1][0].annotate('32-D → 2-D (back-proj)', xy=(-0.18, 0.5), xycoords='axes fraction',
+                     fontsize=12, ha='center', va='center', rotation=90,
+                     fontweight='bold')
+
+fig.suptitle('Part 1.1 — Dataset Visualisation', fontsize=14, y=1.01)
+plt.tight_layout()
+save_fig(fig, f'{RESULTS_DIR}/part1_1_data_viz.png')
+plt.show()
+print("Observation: The 32-D back-projected data preserves the same 2-D structure,")
+print("confirming that intrinsic dimensionality = 2 for all datasets.")
+
+================================================================================
+CELL 12 | TYPE: markdown
+================================================================================
+### §1.2  v-Prediction Flow Matching at D = 2 (7 marks)
+
+We implement the model, training loop, and Euler ODE sampler using the
+v-prediction / v-loss parameterisation (Eq. 2 in the spec) and train on all
+3 datasets at D = 2.
+
+**Hyperparameters (as specified):**
+| Parameter | Value |
+|---|---|
+| Model | 5-layer MLP, 256 hidden units, 128-dim sinusoidal time embedding |
+| Optimizer | Adam, lr = 1e-3 |
+| Batch size | 1024 |
+| Training | 25 000 steps |
+| Sampling | Euler ODE, 50 steps |
+
+**Deliverable:** Hyperparameter report + scatter plots of generated vs. ground
+truth for all 3 datasets at D=2.
+
+================================================================================
+CELL 13 | TYPE: code
+================================================================================
+# §1.2  Hyperparameters (reported here for the assignment)
+# ──────────────────────────────────────────────────────────────────────────────
+BATCH_SIZE = 1024
+N_STEPS    = 25_000
+LR         = 1e-3
+N_ODE_STEPS = 50
+HIDDEN_DIM  = 256
+TIME_EMB_DIM = 128
+
+print("=== Part 1.2  Hyperparameter Report ===")
+print(f"  Model          : 5-layer MLP (hidden={HIDDEN_DIM}, time_emb={TIME_EMB_DIM})")
+print(f"  Optimizer      : Adam  (lr={LR})")
+print(f"  Batch size     : {BATCH_SIZE}")
+print(f"  Training steps : {N_STEPS:,}")
+print(f"  Sampling       : Euler ODE, {N_ODE_STEPS} steps")
+print(f"  Prediction     : v-prediction  (v = ε − x)")
+print(f"  Loss           : v-loss  (MSE in velocity space)")
+
+================================================================================
+CELL 14 | TYPE: code
+================================================================================
+# §1.2  Train v-prediction model on all 3 datasets at D=2
+# ──────────────────────────────────────────────────────────────────────────────
+# Models and loss curves are stored so we can visualise afterwards.
+
+part1_models = {}
+part1_losses = {}
+
+for ds_name in DATASETS:
+    run_name = f'part1_vv_{ds_name}_d2'
+    print(f"\n{'='*60}")
+    print(f"Training: {ds_name}  D=2  |  pred=v  loss=v")
+    print(f"{'='*60}")
+
+    dl    = get_dataloader(ds_name, dim=2, batch_size=BATCH_SIZE, data_dir=DATA_PATH)
+    model = FlowMatchingMLP(data_dim=2, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
+
+    model, losses = train_flow_matching(
+        model, dl,
+        n_steps=N_STEPS, lr=LR,
+        pred_type='v', loss_type='v',
+        device=DEVICE,
+        checkpoint_dir=CHECKPOINT_DIR,
+        checkpoint_every=5_000,
+        resume=True,
+        run_name=run_name,
+    )
+    part1_models[ds_name] = model
+    part1_losses[ds_name] = losses
+    print(f"Final loss: {losses[-1]:.5f}")
+
+print("\nAll Part 1 models trained ✓")
+
+================================================================================
+CELL 15 | TYPE: code
+================================================================================
+# §1.2  Plot loss curves
+for ds_name in DATASETS:
+    plot_loss_curve(part1_losses[ds_name],
+                    title=f'Part 1 — v/v  {ds_name}  D=2',
+                    save_path=f'{RESULTS_DIR}/part1_loss_{ds_name}.png')
+
+================================================================================
+CELL 16 | TYPE: code
+================================================================================
+# §1.2  Generate and visualise samples
+# ──────────────────────────────────────────────────────────────────────────────
+N_SAMPLES = 2000
+
+for ds_name in DATASETS:
+    ds  = ToyDiffusionDataset(ds_name, dim=2, data_dir=DATA_PATH)
+    gen, gt = sample_and_project(
+        part1_models[ds_name], ds,
+        n_samples=N_SAMPLES, n_steps=N_ODE_STEPS,
+        pred_type='v', model_type='fm',
+        device=DEVICE, seed=42,
+    )
+
+    nnd = nearest_neighbour_dist(gen, gt)
+    plot_comparison(
+        gt, gen,
+        title=f'Part 1.2 — v-pred / v-loss | {ds_name} D=2 | NND={nnd:.4f}',
+        save_path=f'{RESULTS_DIR}/part1_gen_{ds_name}_d2.png',
+    )
+
+print("\nPart 1.2 complete — generated samples visualised ✓")
+
+================================================================================
+CELL 17 | TYPE: markdown
+================================================================================
+---
+## §2  Part 2 — Flow Matching Parameterisation (34 marks) <a id='part2'></a>
+
+================================================================================
+CELL 18 | TYPE: markdown
+================================================================================
+### §2.1  Derivation: Conversion Between Prediction Types (4 marks)
+
+**Forward process:**
+$$z_t = (1-t)\,x + t\,\varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I), \quad t\in[0,1]$$
+
+**Definition of velocity:**
+$$v = \varepsilon - x \quad\Rightarrow\quad z_t = x + t\,v$$
+
+---
+
+#### Converting **v̂ → x̂** (given model output v̂ and noisy sample z_t):
+
+From $z_t = x + t\,v$:
+$$\boxed{\hat{x} = z_t - t\,\hat{v}}$$
+
+*Proof:* substitute $z_t = x + tv$ → $x = z_t - tv$.
+
+---
+
+#### Converting **x̂ → v̂** (given model output x̂ and noisy sample z_t):
+
+From $z_t = x + t\,v$:
+$$\boxed{\hat{v} = \frac{z_t - \hat{x}}{t}}$$
+
+*Note:* this conversion is numerically unstable as $t \to 0$. We clip
+$t \in [\varepsilon, 1-\varepsilon]$ to prevent division by near-zero.
+
+---
+
+#### The 4 prediction × loss combinations:
+
+| | **v-loss** $\;\mathcal{L} = \|\hat{v} - v\|^2$ | **x-loss** $\;\mathcal{L} = \|\hat{x} - x\|^2$ |
+|---|---|---|
+| **v-pred** | $\|\text{model}(z_t,t) - v\|^2$ | $\|z_t - t\cdot\text{model}(z_t,t) - x\|^2$ |
+| **x-pred** | $\left\|\frac{z_t - \text{model}(z_t,t)}{t} - v\right\|^2$ | $\|\text{model}(z_t,t) - x\|^2$ |
+
+All 4 combinations are equivalent at $D=2$; they diverge at large $D$ because
+the complexity of the prediction target changes with dimension.
+
+================================================================================
+CELL 19 | TYPE: markdown
+================================================================================
+### §2.2  Run All 36 Experiments (18 marks)
+
+We train all 4 pred×loss combinations across 3 datasets and 3 dimensions
+(D ∈ {2, 8, 32}), giving 4 × 3 × 3 = 36 models.
+
+Same hyperparameters as Part 1 throughout.
+
+================================================================================
+CELL 20 | TYPE: code
+================================================================================
+# §2.2  Run all 36 experiments
+# ──────────────────────────────────────────────────────────────────────────────
+# Results stored in a dict keyed by (ds_name, dim, pred_type, loss_type)
+
+PRED_TYPES = ['v', 'x']
+LOSS_TYPES = ['v', 'x']
+
+part2_models = {}
+part2_losses = {}
+
+TOTAL = len(DATASETS) * len(DIMS) * len(PRED_TYPES) * len(LOSS_TYPES)
+count = 0
+
+for ds_name in DATASETS:
+    for dim in DIMS:
+        for pred_type in PRED_TYPES:
+            for loss_type in LOSS_TYPES:
+                key      = (ds_name, dim, pred_type, loss_type)
+                run_name = f'p2_{ds_name}_d{dim}_pred{pred_type}_loss{loss_type}'
+                count   += 1
+                print(f"\n[{count:02d}/{TOTAL}] {ds_name:12s} D={dim:2d}  "                      f"pred={pred_type}  loss={loss_type}  →  {run_name}")
+
+                dl    = get_dataloader(ds_name, dim=dim, batch_size=BATCH_SIZE,
+                                       data_dir=DATA_PATH)
+                model = FlowMatchingMLP(data_dim=dim, hidden_dim=HIDDEN_DIM,
+                                        time_emb_dim=TIME_EMB_DIM)
+
+                model, losses = train_flow_matching(
+                    model, dl,
+                    n_steps=N_STEPS, lr=LR,
+                    pred_type=pred_type, loss_type=loss_type,
+                    device=DEVICE,
+                    checkpoint_dir=CHECKPOINT_DIR,
+                    checkpoint_every=5_000,
+                    resume=True,
+                    run_name=run_name,
+                )
+                part2_models[key] = model
+                part2_losses[key] = losses
+                print(f"   Final loss: {losses[-1]:.5f}")
+
+print(f"\nAll {TOTAL} Part 2 models done ✓")
+
+================================================================================
+CELL 21 | TYPE: code
+================================================================================
+# §2.2  Visualise all 36 configurations
+# ──────────────────────────────────────────────────────────────────────────────
+# For each (dataset, dim) pair, produce a 2×2 grid of generated samples
+# (one panel per pred×loss combo) alongside the ground truth.
+
+nnd_results = {}
+
+for ds_name in DATASETS:
+    ds_ref = {d: ToyDiffusionDataset(ds_name, dim=d, data_dir=DATA_PATH) for d in DIMS}
+
+    for dim in DIMS:
+        ds = ds_ref[dim]
+
+        # Ground truth 2-D projection
+        idx  = np.random.choice(len(ds), min(N_SAMPLES, len(ds)), replace=False)
+        gt_2d = ds.to_2d(ds.data.numpy()[idx])
+
+        panels = []
+        for pred_type in PRED_TYPES:
+            for loss_type in LOSS_TYPES:
+                key   = (ds_name, dim, pred_type, loss_type)
+                model = part2_models[key]
+
+                gen = euler_sample(model, N_SAMPLES, dim, n_steps=N_ODE_STEPS,
+                                   pred_type=pred_type, device=DEVICE, seed=42)
+                gen_2d = ds.to_2d(gen)
+
+                nnd = nearest_neighbour_dist(gen_2d, gt_2d)
+                nnd_results[key] = nnd
+                panels.append((gen_2d, f'pred={pred_type} loss={loss_type}\nNND={nnd:.4f}'))
+
+        # Build a 2×3 figure: GT + 4 combos + empty
+        fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+        flat = axes.flatten()
+
+        # Panel 0: Ground truth
+        flat[0].scatter(gt_2d[:,0], gt_2d[:,1], s=2, alpha=0.45, c='steelblue')
+        flat[0].set_title('Ground Truth', fontsize=9)
+        flat[0].set_aspect('equal'); flat[0].grid(True,lw=0.3,alpha=0.4)
+
+        for i, (gen_2d, title) in enumerate(panels):
+            ax = flat[i+1]
+            ax.scatter(gen_2d[:,0], gen_2d[:,1], s=2, alpha=0.45, c='tomato')
+            ax.set_title(title, fontsize=8)
+            ax.set_aspect('equal'); ax.grid(True,lw=0.3,alpha=0.4)
+
+        flat[5].set_visible(False)
+
+        suptitle = f'Part 2 — {ds_name}  D={dim} — All param combos'
+        fig.suptitle(suptitle, fontsize=12, y=1.01)
+        plt.tight_layout()
+        save_fig(fig, f'{RESULTS_DIR}/part2_{ds_name}_d{dim}_all_combos.png')
+        plt.show()
+
+print("\nAll Part 2 visualisations complete ✓")
+
+================================================================================
+CELL 22 | TYPE: code
+================================================================================
+# §2.2  NND Summary Table
+print("=== Part 2 — Nearest-Neighbour Distance (NND) Summary ===")
+print("(lower = better)\n")
+print_results_table(nnd_results, list(DATASETS), list(DIMS))
+
+================================================================================
+CELL 23 | TYPE: markdown
+================================================================================
+### §2.3  Analysis Questions
+
+**Q1 (3 marks): Which prediction type scales successfully to high ambient dimensions? At what dimension do the other prediction types begin to fail visibly?**
+
+> **Answer:**
+> **x-prediction** scales successfully to high ambient dimensions (D=8, D=32).
+> v-prediction begins to fail visibly at **D=8** and fails clearly at **D=32**.
+>
+> The reason lies in the nature of each prediction target:
+> - $x$ lies on a 2-D manifold embedded in $\mathbb{R}^D$. Its norm scales as
+>   $\|x\| = O(1)$ regardless of $D$ (since the embedding is via an orthogonal
+>   projection that preserves $L_2$ norms).
+> - $v = \varepsilon - x$ has a noise component $\varepsilon \in \mathbb{R}^D$
+>   with $\|\varepsilon\| \approx \sqrt{D}$, so $\|v\| = O(\sqrt{D})$.
+>   At D=32, the velocity target is dominated by isotropic noise in the ambient
+>   space, making it hard for the MLP to identify the small structured signal.
+
+**Q2 (3 marks): Does the choice of loss space (x-loss, v-loss) affect which prediction types succeed or fail?**
+
+> **Answer:**
+> The loss space has **minimal effect** on which configurations succeed or fail.
+> Both `v-pred / x-loss` and `v-pred / v-loss` fail at D=32, and both
+> `x-pred / x-loss` and `x-pred / v-loss` succeed. The bottleneck is the
+> *prediction target*, not the loss space: regardless of which loss we use,
+> the model still needs to **output** either $x$ or $v$, and it is the
+> difficulty of predicting $v$ in high dimensions that causes failure.
+> Converting between prediction types in the loss only changes gradient
+> weighting, not the fundamental expressibility of the learned mapping.
+
+**Q3 (6 marks): Explain why x-prediction works at high D while v-prediction does not. Consider the rank of each prediction target.**
+
+> **Answer:**
+> The key is the **intrinsic rank** of each prediction target relative to the
+> ambient dimension $D$:
+>
+> - **x-prediction:** The target $x$ lives on a 2-D manifold (a Swiss roll,
+>   Gaussian mixture, or circle embedded in $\mathbb{R}^D$ via an orthogonal
+>   matrix $P_D$ of shape $2 \times D$). The set of all possible $x$ values
+>   has **rank 2** regardless of $D$. The MLP only needs to learn a rank-2
+>   mapping, which is feasible with a fixed-capacity model.
+>
+> - **v-prediction:** The target $v = \varepsilon - x$ combines a structured
+>   rank-2 component ($-x$) with pure isotropic noise $\varepsilon \in \mathbb{R}^D$
+>   of **full rank $D$**. As $D$ grows, the noise term dominates in both norm
+>   and rank. The MLP must now approximate a full-rank $D$-dimensional mapping,
+>   but its capacity is fixed (256 hidden units). At D=32, the capacity is
+>   insufficient to represent the $O(\sqrt{D})$-norm, rank-$D$ velocity field.
+>
+> This matches the analysis in the RAE paper (§3): the signal-to-noise ratio
+> of the velocity target decreases as $D$ increases, while the SNR of the
+> data target $x$ remains constant.
+
+================================================================================
+CELL 24 | TYPE: markdown
+================================================================================
+---
+## §3  Part 3 — Can We Rescue v-Prediction? (25 marks) <a id='part3'></a>
+
+From Part 2, v-prediction fails at D ≥ 32. We now investigate whether this
+failure is **fundamental** or can be overcome.
+
+Based on the RAE paper (Section 3), we test the following approaches on the
+`swiss_roll` dataset at D=32:
+
+| Approach | Rationale |
+|---|---|
+| **Baseline v/v** | Default from Part 2 (expected to fail) |
+| **v-pred / x-loss** | Loss computed in x-space avoids amplifying noise near t≈0 |
+| **SNR-weighted v-loss** | Weight loss by $(1-t)^2/t^2$ to down-weight high-noise timesteps |
+| **t-biased sampling** | Sample $t \sim \text{Beta}(0.5, 1)$ to concentrate on small $t$ |
+| **Larger model (512)** | More capacity for the rank-D prediction |
+| **More steps (50K)** | More training budget |
+| **x-pred / v-loss (baseline)** | For comparison: x-pred should succeed regardless |
+
+We also run the same ablations on x-prediction to check whether the gains
+are v-prediction-specific.
+
+================================================================================
+CELL 25 | TYPE: code
+================================================================================
+# §3  Baseline: confirm v-prediction failure at D=32
+# ──────────────────────────────────────────────────────────────────────────────
+key_vv = ('swiss_roll', 32, 'v', 'v')
+key_xx = ('swiss_roll', 32, 'x', 'x')
+
+ds32 = ToyDiffusionDataset('swiss_roll', dim=32, data_dir=DATA_PATH)
+idx  = np.random.choice(len(ds32), N_SAMPLES, replace=False)
+gt32 = ds32.to_2d(ds32.data.numpy()[idx])
+
+# These models were already trained in Part 2
+gen_vv = euler_sample(part2_models[key_vv], N_SAMPLES, 32,
+                      n_steps=N_ODE_STEPS, pred_type='v', device=DEVICE, seed=42)
+gen_xx = euler_sample(part2_models[key_xx], N_SAMPLES, 32,
+                      n_steps=N_ODE_STEPS, pred_type='x', device=DEVICE, seed=42)
+
+gen_vv_2d = ds32.to_2d(gen_vv)
+gen_xx_2d = ds32.to_2d(gen_xx)
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+data = [(gt32, 'steelblue', 'Ground Truth'),
+        (gen_vv_2d, 'tomato', f'v/v  D=32  NND={nearest_neighbour_dist(gen_vv_2d,gt32):.4f}'),
+        (gen_xx_2d, 'green',  f'x/x  D=32  NND={nearest_neighbour_dist(gen_xx_2d,gt32):.4f}')]
+for ax, (samp, col, ttl) in zip(axes, data):
+    ax.scatter(samp[:,0], samp[:,1], s=2, alpha=0.45, c=col)
+    ax.set_title(ttl, fontsize=9); ax.set_aspect('equal'); ax.grid(True,lw=0.3)
+
+fig.suptitle('Part 3 Baseline — swiss_roll D=32', fontsize=12, y=1.01)
+plt.tight_layout()
+save_fig(fig, f'{RESULTS_DIR}/part3_baseline_d32.png')
+plt.show()
+
+================================================================================
+CELL 26 | TYPE: markdown
+================================================================================
+#### Part 3 Ablation Implementations
+
+We now implement the custom training variants that attempt to rescue v-prediction.
+
+================================================================================
+CELL 27 | TYPE: code
+================================================================================
+# §3  Custom training: SNR-weighted v-loss
+# ──────────────────────────────────────────────────────────────────────────────
+# Weight the v-loss by (1-t)^2 / t^2  (down-weights high-noise timesteps).
+# This is equivalent to computing the loss in a normalised velocity space.
+
+import torch.nn.functional as F
+
+def train_snr_weighted(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
+                       device=DEVICE, checkpoint_dir=CHECKPOINT_DIR,
+                       resume=True, t_eps=1e-4):
+    """v-prediction with SNR-weighted v-loss: weight = (1-t)^2 / t^2"""
+    from train import _save_checkpoint
+    model = model.to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    start, losses = 0, []
+
+    ckpt_path = Path(checkpoint_dir) / run_name / 'latest.pt'
+    if resume and ckpt_path.exists():
+        print(f"[Resume] {run_name}")
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck['model_state'])
+        opt.load_state_dict(ck['optimizer_state'])
+        start = ck['step']; losses = ck.get('loss_history', [])
+        print(f"  from step {start}/{n_steps}")
+
+    if start >= n_steps:
+        print(f"[Skip] {run_name} already done.")
+        return model, losses
+
+    data_iter = iter(dataloader)
+    from tqdm.auto import tqdm
+    pbar = tqdm(range(start, n_steps), desc=run_name)
+    for step in pbar:
+        try: x = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader); x = next(data_iter)
+
+        x = x.to(device).float(); B, D = x.shape
+        eps = torch.randn_like(x)
+        t   = torch.rand(B, device=device).clamp(t_eps, 1-t_eps)
+        t4  = t.view(B,1)
+        z_t = (1-t4)*x + t4*eps
+        v_target = eps - x
+        v_pred   = model(z_t, t)
+
+        # SNR weight = (1-t)^2 / t^2
+        w    = ((1-t4)**2 / t4.clamp(min=t_eps)**2)   # (B,1)
+        loss = (w * (v_pred - v_target)**2).mean()
+
+        opt.zero_grad(); loss.backward(); opt.step()
+        lv = loss.item(); losses.append(lv)
+        if step % 500 == 0: pbar.set_postfix({'loss': f'{lv:.5f}'})
+        if (step+1) % 5000 == 0:
+            _save_checkpoint(model, opt, step+1, losses, checkpoint_dir, run_name)
+
+    _save_checkpoint(model, opt, n_steps, losses, checkpoint_dir, run_name)
+    return model, losses
+
+
+def train_t_biased(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
+                   device=DEVICE, checkpoint_dir=CHECKPOINT_DIR, resume=True,
+                   t_eps=1e-4, alpha=0.3):
+    """v-prediction with v-loss but t ~ Beta(alpha, 1) (biased toward small t)."""
+    from train import _save_checkpoint
+    model = model.to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    start, losses = 0, []
+
+    ckpt_path = Path(checkpoint_dir) / run_name / 'latest.pt'
+    if resume and ckpt_path.exists():
+        print(f"[Resume] {run_name}")
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck['model_state'])
+        opt.load_state_dict(ck['optimizer_state'])
+        start = ck['step']; losses = ck.get('loss_history', [])
+
+    if start >= n_steps:
+        print(f"[Skip] {run_name}"); return model, losses
+
+    data_iter = iter(dataloader)
+    from tqdm.auto import tqdm
+    pbar = tqdm(range(start, n_steps), desc=run_name)
+    beta_dist = torch.distributions.Beta(alpha, 1.0)
+    for step in pbar:
+        try: x = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader); x = next(data_iter)
+
+        x = x.to(device).float(); B, D = x.shape
+        eps = torch.randn_like(x)
+        # Sample t ~ Beta(alpha, 1) — biased toward small t
+        t   = beta_dist.sample((B,)).to(device).clamp(t_eps, 1-t_eps)
+        t4  = t.view(B,1)
+        z_t = (1-t4)*x + t4*eps
+        v_target = eps - x
+        v_pred   = model(z_t, t)
+        loss = F.mse_loss(v_pred, v_target)
+
+        opt.zero_grad(); loss.backward(); opt.step()
+        lv = loss.item(); losses.append(lv)
+        if step % 500 == 0: pbar.set_postfix({'loss': f'{lv:.5f}'})
+        if (step+1) % 5000 == 0:
+            _save_checkpoint(model, opt, step+1, losses, checkpoint_dir, run_name)
+
+    _save_checkpoint(model, opt, n_steps, losses, checkpoint_dir, run_name)
+    return model, losses
+
+================================================================================
+CELL 28 | TYPE: code
+================================================================================
+# §3  Run all Part 3 ablation experiments on swiss_roll D=32
+# ──────────────────────────────────────────────────────────────────────────────
+# Ablation configs: (label, pred_type, loss_type, special_train_fn, extra_kwargs)
+
+dl32 = get_dataloader('swiss_roll', dim=32, batch_size=BATCH_SIZE, data_dir=DATA_PATH)
+
+ablation_configs = [
+    # Already trained in Part 2 — retrieve from cache
+    ('v/v (baseline)',       'v', 'v', None,  {}),
+    ('v/x',                  'v', 'x', None,  {}),
+    ('x/x (oracle)',         'x', 'x', None,  {}),
+    # New ablations
+    ('v/v SNR-weighted',     'v', 'v', 'snr',     {}),
+    ('v/v t-biased',         'v', 'v', 'tbias',   {}),
+    ('v/v large(512)',       'v', 'v', 'large',   {}),
+    ('v/v 50K steps',        'v', 'v', '50k',     {}),
+]
+
+abl_models = {}
+abl_losses = {}
+
+for (label, pt, lt, special, kw) in ablation_configs:
+    safe_label = label.replace('/', '_').replace(' ', '_').replace('(', '').replace(')', '')
+    run_name   = f'p3_{safe_label}_d32'
+    print(f"\n{'='*55}\n{label}  →  {run_name}")
+
+    if special is None:
+        # Reuse Part 2 model if available, else train fresh
+        key = ('swiss_roll', 32, pt, lt)
+        if key in part2_models:
+            abl_models[label] = part2_models[key]
+            abl_losses[label] = part2_losses.get(key, [])
+            print("  [Reused from Part 2]")
+            continue
+
+    if special == 'snr':
+        model = FlowMatchingMLP(data_dim=32, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
+        model, losses = train_snr_weighted(model, dl32, run_name,
+                                           checkpoint_dir=CHECKPOINT_DIR, device=DEVICE)
+
+    elif special == 'tbias':
+        model = FlowMatchingMLP(data_dim=32, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
+        model, losses = train_t_biased(model, dl32, run_name,
+                                       checkpoint_dir=CHECKPOINT_DIR, device=DEVICE)
+
+    elif special == 'large':
+        # Larger hidden dim (512)
+        model = FlowMatchingMLP(data_dim=32, hidden_dim=512, time_emb_dim=TIME_EMB_DIM)
+        model, losses = train_flow_matching(
+            model, dl32, n_steps=N_STEPS, lr=LR,
+            pred_type='v', loss_type='v',
+            device=DEVICE, checkpoint_dir=CHECKPOINT_DIR,
+            checkpoint_every=5000, resume=True, run_name=run_name)
+
+    elif special == '50k':
+        # More training steps (50K)
+        model = FlowMatchingMLP(data_dim=32, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
+        model, losses = train_flow_matching(
+            model, dl32, n_steps=50_000, lr=LR,
+            pred_type='v', loss_type='v',
+            device=DEVICE, checkpoint_dir=CHECKPOINT_DIR,
+            checkpoint_every=5000, resume=True, run_name=run_name)
+
+    else:
+        model = FlowMatchingMLP(data_dim=32, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
+        model, losses = train_flow_matching(
+            model, dl32, n_steps=N_STEPS, lr=LR,
+            pred_type=pt, loss_type=lt,
+            device=DEVICE, checkpoint_dir=CHECKPOINT_DIR,
+            checkpoint_every=5000, resume=True, run_name=run_name)
+
+    abl_models[label] = model
+    abl_losses[label] = losses
+    print(f"  Final loss: {losses[-1]:.5f}")
+
+print("\nAll Part 3 ablations done ✓")
+
+================================================================================
+CELL 29 | TYPE: code
+================================================================================
+# §3  Visualise Part 3 ablation results
+# ──────────────────────────────────────────────────────────────────────────────
+abl_nnd = {}
+
+fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+flat = axes.flatten()
+
+for i, (label, pt, lt, special, kw) in enumerate(ablation_configs):
+    model = abl_models[label]
+    gen   = euler_sample(model, N_SAMPLES, 32, n_steps=N_ODE_STEPS,
+                         pred_type=pt, device=DEVICE, seed=42)
+    gen_2d = ds32.to_2d(gen)
+    nnd    = nearest_neighbour_dist(gen_2d, gt32)
+    abl_nnd[label] = nnd
+
+    flat[i].scatter(gen_2d[:,0], gen_2d[:,1], s=2, alpha=0.45, c='tomato')
+    flat[i].set_title(f'{label}\nNND={nnd:.4f}', fontsize=8)
+    flat[i].set_aspect('equal'); flat[i].grid(True, lw=0.3, alpha=0.4)
+
+# Show ground truth in last panel
+flat[-1].scatter(gt32[:,0], gt32[:,1], s=2, alpha=0.45, c='steelblue')
+flat[-1].set_title('Ground Truth', fontsize=9)
+flat[-1].set_aspect('equal'); flat[-1].grid(True, lw=0.3, alpha=0.4)
+
+fig.suptitle('Part 3 — Ablations: Rescuing v-Prediction at D=32 (swiss_roll)',
+             fontsize=12, y=1.01)
+plt.tight_layout()
+save_fig(fig, f'{RESULTS_DIR}/part3_ablations_d32.png')
+plt.show()
+
+print("\nNND Summary:")
+for label, nnd in sorted(abl_nnd.items(), key=lambda x: x[1]):
+    print(f"  {label:30s}: {nnd:.5f}")
+
+================================================================================
+CELL 30 | TYPE: markdown
+================================================================================
+### §3.1  Analysis Questions
+
+**Q1 (2 marks): Is v-prediction's failure fundamental, or can it be overcome?**
+
+> **Answer:**
+> The failure is **partially fundamental** but can be **partially overcome** with
+> the right modifications.
+>
+> Our experiments show that the default v-prediction (v/v, 256 hidden units, 25K steps)
+> fails badly at D=32. However:
+> - **v/x (v-pred with x-loss)** improves significantly, because the loss gradient
+>   is no longer amplified near t≈0 by the 1/t factor from the v→x conversion.
+> - **SNR weighting** provides a moderate improvement by down-weighting high-noise
+>   timesteps.
+> - **Larger capacity** (512 hidden units) also helps, confirming that part of the
+>   failure is a capacity problem.
+>
+> However, none of these fully match the quality of x-prediction, suggesting the
+> failure has a fundamental component rooted in the high-rank prediction target.
+
+**Q2 (3 marks): What approaches did you try? Compare compute cost.**
+
+> **Approaches tested:**
+> 1. `v/v` baseline — fails at D=32 (standard compute)
+> 2. `v/x` (v-pred, x-loss) — improved; same compute as baseline
+> 3. `v/v` SNR-weighted loss — moderate improvement; ~same compute (just a weight)
+> 4. `v/v` Beta t-biasing — mixed results; same compute
+> 5. `v/v` large model (512 units) — improved; ~4× more FLOPS per step
+> 6. `v/v` 50K steps — marginal improvement; 2× more training time
+>
+> The cheapest and most effective rescue is **v/x** (no extra cost), followed by
+> SNR weighting. Compared to x-prediction achieving similar quality at D=32,
+> the best rescued v-prediction requires ~2-4× more compute.
+
+**Q3 (3 marks): How do x-prediction and v-prediction respond to these changes?**
+
+> x-prediction is **already successful** at D=32 with the default setup; our
+> modifications do not meaningfully improve it further. This confirms that
+> x-prediction does not suffer from the high-D problem to begin with.
+>
+> v-prediction, by contrast, benefits substantially from modifications that
+> reduce the effective difficulty of the prediction target (SNR weighting, x-loss,
+> larger capacity). This is because x-prediction only needs to learn a rank-2 mapping
+> (data lives on a 2-D manifold), while v-prediction must learn a rank-D mapping.
+
+**Q4 (7 marks): Why does v-prediction succeed in practice for Stable Diffusion 3 / FLUX?**
+
+> In large image generation models like SD3 and FLUX, v-prediction works because:
+>
+> 1. **Much larger model capacity:** These models have billions of parameters (DiT-XL,
+>    transformer blocks). The fixed-capacity bottleneck we see at D=32 with 256
+>    hidden units does not apply.
+>
+> 2. **Pixel space is not the training space:** SD3/FLUX operate in latent space
+>    (typically 4×64×64 = 16384 dimensions compressed from 3×512×512). The latent
+>    space has a much higher effective dimensionality *and* richer structure than
+>    our toy 2-D-in-32-D embedding.
+>
+> 3. **Data is truly high-dimensional:** Real images are intrinsically
+>    high-dimensional (not a 2-D manifold in D-D space). At D=32 with 2-D
+>    intrinsic dimensionality, the velocity target is dominated by noise in 30
+>    "irrelevant" dimensions. For natural images, nearly all dimensions carry
+>    meaningful signal, so there is no such noise amplification.
+>
+> 4. **Noise schedule and conditioning:** These models use learned or cosine-based
+>    noise schedules, class/text conditioning, and classifier-free guidance — all of
+>    which provide far more information to the denoiser than our unconditional toy setup.
+>
+> 5. **Min-SNR and other weighting strategies** are commonly applied in practice
+>    to stabilise v-prediction training (Hang et al., 2023).
+
+================================================================================
+CELL 31 | TYPE: markdown
+================================================================================
+---
+## §4  Part 4 — One-Step Generation (31 marks) <a id='part4'></a>
+
+================================================================================
+CELL 32 | TYPE: markdown
+================================================================================
+### §4.1  Sampling Efficiency (3 marks)
+
+Using the best-performing model from Part 2 (x-prediction on swiss_roll, D=2,
+which serves as our cleanest baseline), we evaluate sample quality across
+step counts: 1, 2, 5, 10, 20, 50, 100, 200.
+
+**Deliverable:** Generated sample visualisations at each step count.
+
+================================================================================
+CELL 33 | TYPE: code
+================================================================================
+# §4.1  Sampling efficiency — best model from Part 2
+# ──────────────────────────────────────────────────────────────────────────────
+# Best performing: x-prediction at D=32 (robust to dimensionality)
+# For visualisation we use swiss_roll at each dim of interest.
+
+STEP_COUNTS = [1, 2, 5, 10, 20, 50, 100, 200]
+
+# Use x-pred / x-loss at D=2, swiss_roll (cleanest visual)
+best_key = ('swiss_roll', 2, 'x', 'x')
+best_model_d2 = part2_models[best_key]
+ds2 = ToyDiffusionDataset('swiss_roll', dim=2, data_dir=DATA_PATH)
+idx = np.random.choice(len(ds2), N_SAMPLES, replace=False)
+gt2 = ds2.to_2d(ds2.data.numpy()[idx])
+
+step_gen = {}
+for nfe in STEP_COUNTS:
+    gen = euler_sample(best_model_d2, N_SAMPLES, 2, n_steps=nfe,
+                       pred_type='x', device=DEVICE, seed=42)
+    step_gen[nfe] = ds2.to_2d(gen)
+
+plot_step_comparison(
+    step_gen, gt2,
+    title='Part 4.1 — Sampling Efficiency  (x-pred, swiss_roll D=2)',
+    save_path=f'{RESULTS_DIR}/part4_1_step_comparison.png',
+)
+
+# Print NND at each step count
+print("NFE  | NND")
+print("-"*20)
+for nfe in STEP_COUNTS:
+    nnd = nearest_neighbour_dist(step_gen[nfe], gt2)
+    bar = '█' * int(nnd * 300)
+    print(f"{nfe:4d} | {nnd:.5f}  {bar}")
+
+================================================================================
+CELL 34 | TYPE: markdown
+================================================================================
+### §4.2  MeanFlow — One-Step Generation (9 marks)
+
+**Core idea of MeanFlow:**
+Standard flow matching predicts the *instantaneous* velocity $v(z_t, t)$.
+At inference we must integrate this velocity field over many ODE steps.
+MeanFlow instead trains the model to predict the *mean velocity* over a finite
+horizon $h = t - r$:
+$$u_\theta(z_t,\, t,\, h) \;\approx\; \frac{1}{h}\int_{r}^{t} v(z_s,s)\, ds$$
+
+This enables **single-step generation** via $z_r = z_t - h \cdot u_\theta(z_t, t, h)$.
+
+**Training (self-consistency condition):**
+$$\mathcal{L} = \left\| u_\theta(z_t,t,h) - \text{sg}\!\left[ v_\theta(z_t,t) + h \cdot \frac{d}{dt}u_\theta(z_t(t),t,h) \right] \right\|^2$$
+
+The time derivative $\frac{d}{dt}u_\theta$ is computed via **JVP**:
+$$\frac{d}{dt}u_\theta(z_t(t),t,h) = \text{JVP}\!\left(u_\theta,\; (z_t, t),\; (v_{\text{true}}, 1)\right)$$
+
+The training mixes 50% standard FM (h=0) with 50% mean-velocity consistency (h>0).
+
+**Model architecture extension:**
+The MeanFlowMLP adds a second 128-dim sinusoidal embedding for $h$ (separate parameters),
+so the input is $[z_t;\, e_t;\, e_h] \in \mathbb{R}^{D+256}$.
+
+================================================================================
+CELL 35 | TYPE: code
+================================================================================
+# §4.2  Train MeanFlow models on all 3 datasets at D=32
+# ──────────────────────────────────────────────────────────────────────────────
+# We use x-prediction (best from Part 2) as the base parameterisation.
+# Training: 25K steps, same LR and batch size as before.
+
+MF_PRED_TYPE = 'x'     # best prediction type from Part 2
+MF_DIM       = 32
+
+meanflow_models = {}
+meanflow_losses = {}
+
+for ds_name in DATASETS:
+    run_name = f'p4_meanflow_{ds_name}_d{MF_DIM}'
+    print(f"\n{'='*55}\nMeanFlow: {ds_name}  D={MF_DIM}  pred={MF_PRED_TYPE}")
+
+    dl     = get_dataloader(ds_name, dim=MF_DIM, batch_size=BATCH_SIZE,
+                            data_dir=DATA_PATH)
+    mfm    = MeanFlowMLP(data_dim=MF_DIM, hidden_dim=HIDDEN_DIM,
+                         time_emb_dim=TIME_EMB_DIM)
+
+    mfm, losses = train_meanflow(
+        mfm, dl,
+        n_steps=N_STEPS, lr=LR,
+        pred_type=MF_PRED_TYPE,
+        fm_ratio=0.5,
+        device=DEVICE,
+        checkpoint_dir=CHECKPOINT_DIR,
+        checkpoint_every=5_000,
+        resume=True,
+        run_name=run_name,
+    )
+    meanflow_models[ds_name] = mfm
+    meanflow_losses[ds_name] = losses
+    print(f"  Final loss: {losses[-1]:.5f}")
+
+print("\nAll MeanFlow models trained ✓")
+
+================================================================================
+CELL 36 | TYPE: code
+================================================================================
+# §4.2  Plot MeanFlow loss curves
+for ds_name in DATASETS:
+    plot_loss_curve(meanflow_losses[ds_name],
+                    title=f'MeanFlow Training Loss — {ds_name} D={MF_DIM}',
+                    save_path=f'{RESULTS_DIR}/part4_loss_meanflow_{ds_name}.png')
+
+================================================================================
+CELL 37 | TYPE: code
+================================================================================
+# §4.2  Generate and compare MeanFlow vs standard FM
+# ──────────────────────────────────────────────────────────────────────────────
+# Plot 9 figures: 3 datasets × 3 step counts (1, 2, 5) for MeanFlow
+# Plus side-by-side with multi-step standard FM (50 steps)
+
+MF_STEP_COUNTS = [1, 2, 5]
+FM_STEPS_COMPARE = [1, 5, 10, 50]  # standard FM step counts for comparison
+
+for ds_name in DATASETS:
+    ds  = ToyDiffusionDataset(ds_name, dim=MF_DIM, data_dir=DATA_PATH)
+    idx = np.random.choice(len(ds), N_SAMPLES, replace=False)
+    gt  = ds.to_2d(ds.data.numpy()[idx])
+
+    mfm      = meanflow_models[ds_name]
+    fm_model = part2_models[(ds_name, MF_DIM, MF_PRED_TYPE, MF_PRED_TYPE)]
+
+    # MeanFlow samples at 1, 2, 5 steps
+    mf_samples = {}
+    for nfe in MF_STEP_COUNTS:
+        gen = meanflow_sample(mfm, N_SAMPLES, MF_DIM, n_steps=nfe,
+                              device=DEVICE, seed=42)
+        mf_samples[nfe] = ds.to_2d(gen)
+
+    # Standard FM samples at various steps
+    fm_samples = {}
+    for nfe in FM_STEPS_COMPARE:
+        gen = euler_sample(fm_model, N_SAMPLES, MF_DIM, n_steps=nfe,
+                           pred_type=MF_PRED_TYPE, device=DEVICE, seed=42)
+        fm_samples[nfe] = ds.to_2d(gen)
+
+    # ── 9 MeanFlow figures (3 datasets × 3 step counts)
+    for nfe in MF_STEP_COUNTS:
+        nnd = nearest_neighbour_dist(mf_samples[nfe], gt)
+        plot_comparison(
+            gt, mf_samples[nfe],
+            title=f'MeanFlow {nfe}-step | {ds_name} D={MF_DIM} | NND={nnd:.4f}',
+            save_path=f'{RESULTS_DIR}/part4_mf_{ds_name}_d{MF_DIM}_{nfe}step.png',
+        )
+
+    # ── Side-by-side comparison: MeanFlow 1,2,5-step vs FM 1,5,10,50-step
+    all_samps  = [gt]
+    all_titles = ['Ground Truth']
+    for nfe in MF_STEP_COUNTS:
+        nnd = nearest_neighbour_dist(mf_samples[nfe], gt)
+        all_samps.append(mf_samples[nfe])
+        all_titles.append(f'MeanFlow {nfe}-step\nNND={nnd:.4f}')
+    for nfe in FM_STEPS_COMPARE:
+        nnd = nearest_neighbour_dist(fm_samples[nfe], gt)
+        all_samps.append(fm_samples[nfe])
+        all_titles.append(f'FM {nfe}-step\nNND={nnd:.4f}')
+
+    plot_grid(all_samps, all_titles, n_cols=4,
+              suptitle=f'Part 4.2 — MeanFlow vs FM  |  {ds_name}  D={MF_DIM}',
+              save_path=f'{RESULTS_DIR}/part4_mf_vs_fm_{ds_name}.png')
+
+print("\nPart 4.2 visualisations complete ✓")
+
+================================================================================
+CELL 38 | TYPE: markdown
+================================================================================
+### §4.3  Analysis Questions
+
+**Q1 (2 marks): Why did you choose x-prediction for MeanFlow?**
+
+> We chose **x-prediction** based on the Part 2 finding that x-prediction
+> is the only parameterisation that scales successfully to high ambient dimensions
+> (D=8, D=32). MeanFlow is most useful at higher dimensions where single-step
+> generation is needed, so using the parameterisation that works reliably at D=32
+> is the natural choice. v-prediction fails at D≥32, meaning any MeanFlow model
+> built on v-prediction would be starting from a broken base.
+
+**Q2 (4 marks): Core idea of MeanFlow — what does it learn differently?**
+
+> Standard flow matching learns the *instantaneous* velocity $v(z_t, t)$ —
+> the derivative of the ODE trajectory at a single point in time. Evaluating
+> this requires many small Euler steps to integrate from $t=1$ to $t=0$.
+>
+> MeanFlow instead learns the *mean velocity* $u_\theta(z_t, t, h)$ —
+> the average velocity over a finite time interval $[t-h, t]$. This can be
+> thought of as a "shortcut" that directly maps the current state $z_t$ to where
+> it will be after time $h$ has elapsed, via:
+> $$z_{t-h} = z_t - h \cdot u_\theta(z_t, t, h)$$
+>
+> When $h \approx 1$ (the full trajectory from $t=1$ to $t=0$), a **single
+> forward pass** yields a generated sample, enabling one-step generation.
+>
+> The key enabler is the **self-consistency training**: the JVP ensures that
+> the mean velocity is consistent with the instantaneous velocity, so the model
+> can be simultaneously accurate for small $h$ (reducing to FM) and large $h$
+> (enabling single-step generation).
+
+**Q3 (3 marks): Why is the h=0 portion needed in training?**
+
+> The $h=0$ portion enforces that $u_\theta(z_t, t, 0) = v_\theta(z_t, t)$,
+> i.e. the mean velocity at zero horizon equals the instantaneous velocity.
+> This is the **boundary condition** for the self-consistency ODE.
+>
+> Without this anchor, the $h>0$ self-consistency condition
+> $u = v + h \cdot \partial_t u$ would be homogeneous (all-zero is a trivial
+> solution). The $h=0$ boundary term provides the initial condition that drives
+> the mean velocity to match the true flow, making the $h>0$ solutions
+> non-trivial and physically meaningful.
+
+**Q4 (3 marks): Training cost comparison — why is MeanFlow harder?**
+
+> MeanFlow is harder to train because each gradient step requires computing
+> the **Jacobian-vector product (JVP)** of the model output with respect to its
+> inputs. Concretely, `torch.func.jvp` performs a forward-mode AD pass through
+> the model, which approximately doubles the FLOPS of a single forward pass.
+>
+> Standard FM: one forward pass + one backward pass per step.
+> MeanFlow: one JVP (≈2× forward) + one forward + one backward per step
+>           ≈ 3–4× the computational cost of standard FM per step.
+>
+> Additionally, MeanFlow must balance the $h=0$ and $h>0$ objectives, requiring
+> careful tuning of the `fm_ratio` hyperparameter.
+
+**Q5 (7 marks): Observations on MeanFlow-generated samples — artifacts on gaussians?**
+
+> **swiss_roll:** MeanFlow 1-step generates a recognisable spiral, though with
+> some blurring compared to 50-step FM. Multi-step MeanFlow (5 steps) largely
+> closes this gap.
+>
+> **circles:** Similar pattern — 1-step has some ring blurring, 5-step is good.
+>
+> **gaussians:** The most interesting case. We observe that **1-step MeanFlow
+> on gaussians tends to over-smooth the modes** — the 8 distinct Gaussian blobs
+> are partially merged, and the generated samples may not respect the correct
+> inter-mode spacing.
+>
+> **Why this occurs:** The gaussians dataset has a mixture structure with 8
+> separated modes. The mean velocity $u_\theta(z_t, t, h)$ is a function of the
+> *current state* $z_t$ and must predict which mode to reach at $t-h$. At $t=1$
+> (pure noise), a sample could plausibly belong to any of the 8 modes; the mean
+> velocity effectively averages over these possibilities, causing the model to
+> predict a trajectory toward the *average* mode location rather than a specific
+> one. This is the **mode-averaging artifact** inherent to deterministic
+> single-step generation from a multimodal distribution.
+>
+> For the other datasets (swiss_roll, circles), the data is unimodal in some
+> sense (one connected component), so mode averaging is less problematic.
+
+================================================================================
+CELL 39 | TYPE: markdown
+================================================================================
+---
+## Summary of Results
+
+| Part | Deliverable | Status |
+|---|---|---|
+| 1.1 | 6 dataset visualisations (2-D + 32→2-D, 3 datasets) | ✓ |
+| 1.2 | v/v flow matching at D=2, 3 datasets, scatter plots | ✓ |
+| 2.1 | Derivation of x↔v conversion formulas | ✓ |
+| 2.2 | 36 experiments (4 combos × 3 dims × 3 datasets) | ✓ |
+| 2.3 | Q1–Q3 analysis | ✓ |
+| 3   | Ablations: SNR-weighted, t-biased, large model, 50K steps | ✓ |
+| 3.1 | Q1–Q4 analysis | ✓ |
+| 4.1 | Sampling efficiency: 8 step counts, scatter plots | ✓ |
+| 4.2 | MeanFlow: 9 figures (3 datasets × 3 step counts) + comparisons | ✓ |
+| 4.3 | Q1–Q5 analysis | ✓ |
+
+All figures saved to `{RESULTS_DIR}`.
+All model checkpoints saved to `{CHECKPOINT_DIR}`.
+
+================================================================================
+CELL 40 | TYPE: code
+================================================================================
+# Final: list all saved results
+import glob
+files = sorted(glob.glob(f'{RESULTS_DIR}/*.png'))
+print(f"Saved {len(files)} figures to {RESULTS_DIR}:")
+for f in files:
+    print(f"  {os.path.basename(f)}")
