@@ -106,6 +106,7 @@ def meanflow_sample(
     dim: int,
     *,
     n_steps: int = 1,
+    pred_type: str = "x",
     device: str = "cpu",
     t_eps: float = T_EPS,
     seed: int | None = None,
@@ -155,11 +156,22 @@ def meanflow_sample(
         t_batch = t_curr.expand(n_samples)
         h_batch = h_val.expand(n_samples)
 
-        # u_θ(z_t, t, h) — mean velocity over the horizon [t−h, t]
-        u = model(z, t_batch, h_batch)
+        # # u_θ(z_t, t, h) — mean velocity over the horizon [t−h, t]
+        # u = model(z, t_batch, h_batch)
 
-        # Jump:  z_{t−h} = z_t − h · u
-        z = z - h_val * u
+        # # Jump:  z_{t−h} = z_t − h · u
+        # z = z - h_val * u
+        x_hat = model(z, t_batch, h_batch)  # model outputs x̂
+
+        if pred_type == 'x':
+            # Convert x̂ → mean velocity: u = (z − x̂) / t
+            t_val = float(t_curr)
+            u = (z - x_hat) / max(t_val, t_eps)
+        else:
+            u = x_hat  # model directly outputs velocity (v-prediction)
+
+        z = z - h_val * u   # MeanFlow step: z_{t-h} = z_t - h·u
+        # Equivalently: z = z*(1 - h/t) + x_hat*(h/t)  for x-prediction
 
     return z.cpu().numpy()
 
@@ -196,7 +208,7 @@ def sample_and_project(
     elif model_type == "meanflow":
         gen = meanflow_sample(
             model, n_samples, dim,
-            n_steps=n_steps, device=device, seed=seed,
+            n_steps=n_steps, pred_type=pred_type, device=device, seed=seed,
         )
     else:
         raise ValueError(f"Unknown model_type: '{model_type}'")
