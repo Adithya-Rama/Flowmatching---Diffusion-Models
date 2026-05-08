@@ -72,25 +72,11 @@ def meanflow_loss(
     device: str = "cpu",
     t_eps: float = T_EPS,
 ) -> torch.Tensor:
-    """
-    Compute the MeanFlow training loss.
-
-    Args:
-        model     : MeanFlowMLP with signature model(z, t, h)
-        x         : clean data batch  (B, D)
-        pred_type : 'x' (recommended from Part 2) or 'v'
-        fm_ratio  : fraction of batch used for standard FM (h=0)
-        device    : torch device string
-        t_eps     : numerical floor for t
-
-    Returns:
-        scalar loss (mean of FM loss and mean-velocity loss)
-    """
     x   = x.to(device).float()
     B, D = x.shape
 
-    split    = max(1, int(B * fm_ratio))   # FM half
-    mv_start = split                       # mean-velocity half
+    split    = max(1, int(B * fm_ratio))
+    mv_start = split
 
     losses = []
 
@@ -107,13 +93,11 @@ def meanflow_loss(
     z_fm   = (1.0 - t4_fm) * x_fm + t4_fm * eps_fm
     h_zero = torch.zeros(B_fm, device=device)
 
-    pred_fm = model(z_fm, t_fm, h_zero)          # u_θ(z_t, t, 0) should equal v_θ
+    pred_fm = model(z_fm, t_fm, h_zero)
 
     if pred_type == "x":
-        # Model's FM head predicts x;  target is x
         target_fm = x_fm
     else:
-        # Model's FM head predicts v;  target is ε − x
         target_fm = eps_fm - x_fm
 
     loss_fm = nn.functional.mse_loss(pred_fm, target_fm)
@@ -128,55 +112,53 @@ def meanflow_loss(
 
         eps_mv = torch.randn_like(x_mv)
 
-        # Sample r and t with 0 < r < t ≤ 1
         r_mv  = torch.rand(B_mv, device=device).clamp(t_eps, 1.0 - t_eps)
         delta = torch.rand(B_mv, device=device) * (1.0 - r_mv - t_eps)
         t_mv  = (r_mv + delta).clamp(t_eps, 1.0 - t_eps)
-        h_mv  = (t_mv - r_mv).clamp(min=t_eps)    # horizon
+        h_mv  = (t_mv - r_mv).clamp(min=t_eps)
 
         t4_mv = t_mv.view(B_mv, 1)
         z_mv  = (1.0 - t4_mv) * x_mv + t4_mv * eps_mv
 
-        # True velocity (= dz_t / dt)
-        v_true = eps_mv - x_mv                     # (B_mv, D)
+        v_true = eps_mv - x_mv
 
-        # ── Compute JVP:  d/dt u_θ(z_t(t), t, h)  (h held fixed as a constant)
-        # primals  = (t_mv,  z_mv)
-        # tangents = (ones,  v_true)
         try:
             ones_t = torch.ones_like(t_mv)
-            primals  = (t_mv, z_mv)
-            tangents = (ones_t, v_true)
 
-            # torch.func.jvp requires functorch-style usage; we use a closure
-            # that captures h_mv from the outer scope.
             def _model_fn(t_in: torch.Tensor, z_in: torch.Tensor) -> torch.Tensor:
                 return model(z_in, t_in, h_mv)
 
             with torch.enable_grad():
-                u_mv, du_dt = torch.func.jvp(_model_fn, primals, tangents)
+                u_mv, du_dt = torch.func.jvp(_model_fn, (t_mv, z_mv), (ones_t, v_true))
 
-            # ── Convert model output to velocity space for the target
+            # ── Convert model output to velocity space
             if pred_type == "x":
-                # u_mv is x̂;  convert to v̂ = (z − x̂) / t
                 v_pred = (z_mv - u_mv) / t4_mv.clamp(min=t_eps)
-                # du_dt is d(x̂)/dt;  convert tangent too:  dv̂/dt = (v_true − dx̂/dt) / t − v̂/t
-                # (product-rule derivative of (z−x̂)/t)
-                dv_dt  = (v_true - du_dt) / t4_mv.clamp(min=t_eps) - v_pred / t4_mv.clamp(min=t_eps)
+                dv_dt  = (v_true - du_dt) / t4_mv.clamp(min=t_eps) \
+                         - v_pred / t4_mv.clamp(min=t_eps)
             else:
-                v_pred = u_mv        # model directly outputs velocity
+                v_pred = u_mv
                 dv_dt  = du_dt
 
-            # ── Self-consistency target (stop-gradient on the target)
-            h4 = h_mv.view(B_mv, 1)
+            # ── FIX: get instantaneous velocity at h=0 for the target
+            # The paper (Eq.4) requires: target = sg[ v(h=0) + h · D_t u ]
+            # NOT sg[ u(h>0) + h · D_t u ] — that old form had D_t u = 0
+            # as a degenerate zero-cost solution, causing full model collapse.
             with torch.no_grad():
-                target_v = (v_pred + h4 * dv_dt).detach()
+                h_zero_mv = torch.zeros_like(h_mv)
+                u_h0 = model(z_mv, t_mv, h_zero_mv)   # instantaneous pred at h=0
+                if pred_type == "x":
+                    v_h0 = (z_mv - u_h0) / t4_mv.clamp(min=t_eps)
+                else:
+                    v_h0 = u_h0
 
-            # ── Loss in velocity space
+            # ── Self-consistency target using v_h0 (not v_pred)
+            h4 = h_mv.view(B_mv, 1)
+            target_v = (v_h0 + h4 * dv_dt).detach()
+
             loss_mv = nn.functional.mse_loss(v_pred, target_v)
 
         except Exception as _e:
-            # Fallback: pure flow matching if JVP fails (e.g. on certain backends)
             tqdm.write(f"[MeanFlow] JVP fallback: {_e}")
             pred_fallback = model(z_mv, t_mv, h_mv)
             if pred_type == "x":
@@ -188,7 +170,6 @@ def meanflow_loss(
         losses.append(loss_mv)
 
     return sum(losses) / len(losses)
-
 
 # ---------------------------------------------------------------------------
 # Training loop
