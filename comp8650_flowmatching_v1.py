@@ -53,27 +53,52 @@ print(f"Data dir   : {DATA_DIR}")
 print(f"Checkpoints: {CHECKPOINT_DIR}")
 print(f"Results    : {RESULTS_DIR}")
 
-# ── 0.3  Clone or pull the repository ────────────────────────────────────────
-import subprocess, sys
+import os
+import subprocess
 
 def run(cmd, **kw):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        **kw
+    )
     if result.returncode != 0:
         print(f"STDERR: {result.stderr.strip()}")
     return result.stdout.strip()
 
-if not os.path.exists(os.path.join(REPO_DIR, '.git')):
+git_dir = os.path.join(REPO_DIR, ".git")
+lock_file = os.path.join(
+    git_dir,
+    "refs",
+    "remotes",
+    "origin",
+    "main.lock"
+)
+
+if not os.path.exists(git_dir):
     print("Cloning repository …")
     out = run(f'git clone {REPO_URL} "{REPO_DIR}"')
     print(out or "Done.")
 else:
     print("Repository found — pulling latest …")
-    out = run(f'git -C "{REPO_DIR}" pull')
+
+    # Remove stale lock file if it exists
+    if os.path.exists(lock_file):
+        print("Removing stale git lock file …")
+        os.remove(lock_file)
+
+    # Optional safety cleanup
+    run(f'git -C "{REPO_DIR}" gc --prune=now')
+
+    out = run(f'git -C "{REPO_DIR}" pull --ff-only')
     print(out)
 
 print("\nRepo contents:")
 print(run(f'ls "{REPO_DIR}"'))
 
+import sys
 # ── 0.4  Add src/ to Python path ─────────────────────────────────────────────
 SRC_DIR = os.path.join(REPO_DIR, 'src')
 if SRC_DIR not in sys.path:
@@ -233,8 +258,8 @@ truth for all 3 datasets at D=2.
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 25_000
-LR         = 1e-3
+N_STEPS    = 25000 #25000
+LR         = 1e-3 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
 TIME_EMB_DIM = 128

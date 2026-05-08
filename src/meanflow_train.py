@@ -72,7 +72,7 @@ def meanflow_loss(
     device: str = "cpu",
     t_eps: float = T_EPS,
 ) -> torch.Tensor:
-    x   = x.to(device).float()
+    x    = x.to(device).float()
     B, D = x.shape
 
     split    = max(1, int(B * fm_ratio))
@@ -82,9 +82,8 @@ def meanflow_loss(
     # ══════════════════════════════════════════════════════════════════════
     # 1.  Standard Flow Matching  (h = 0)
     # ══════════════════════════════════════════════════════════════════════
-    x_fm  = x[:split]
-    B_fm  = x_fm.shape[0]
-
+    x_fm   = x[:split]
+    B_fm   = x_fm.shape[0]
     eps_fm = torch.randn_like(x_fm)
     t_fm   = torch.rand(B_fm, device=device).clamp(t_eps, 1.0 - t_eps)
     t4_fm  = t_fm.view(B_fm, 1)
@@ -100,43 +99,36 @@ def meanflow_loss(
     # 2.  Mean-velocity consistency  (h > 0)
     # ══════════════════════════════════════════════════════════════════════
     if B - split > 0:
-        x_mv  = x[mv_start:]
-        B_mv  = x_mv.shape[0]
-
+        x_mv   = x[mv_start:]
+        B_mv   = x_mv.shape[0]
         eps_mv = torch.randn_like(x_mv)
         r_mv   = torch.rand(B_mv, device=device).clamp(t_eps, 1.0 - t_eps)
         delta  = torch.rand(B_mv, device=device) * (1.0 - r_mv - t_eps)
         t_mv   = (r_mv + delta).clamp(t_eps, 1.0 - t_eps)
         h_mv   = (t_mv - r_mv).clamp(min=t_eps)
-
         t4_mv  = t_mv.view(B_mv, 1)
         z_mv   = (1.0 - t4_mv) * x_mv + t4_mv * eps_mv
 
         try:
             ones_h = torch.ones_like(h_mv)
 
-            # ── CORRECT JVP: differentiate w.r.t. h ONLY, holding (z, t) fixed.
-            # This gives ∂x̂/∂h|_{z,t}  (or ∂v̂/∂h for v-pred) — no 1/t anywhere.
-            # Identity: u + h·(∂u/∂h)|_{z,t} = v_true
-            # → target in x̂-space:  x̂_h = x̂_0 − h·(∂x̂/∂h)
-            # → target in v̂-space:  v̂_h = v̂_0 − h·(∂v̂/∂h)
-
-            def _model_fn_h(h_in: torch.Tensor) -> torch.Tensor:
-                return model(z_mv, t_mv, h_in)   # z and t are captured constants
+            def _model_fn_h(h_in):
+                return model(z_mv, t_mv, h_in)  # z,t fixed; differentiate w.r.t. h only
 
             with torch.enable_grad():
                 pred_h, dpred_dh = torch.func.jvp(
                     _model_fn_h, (h_mv,), (ones_h,)
                 )
 
-            # Instantaneous prediction at h=0 — stop-gradient anchor
-            with torch.no_grad():
-                pred_0 = model(z_mv, t_mv, torch.zeros_like(h_mv))
-
-            # Self-consistency target (no 1/t — numerically stable)
-            h4       = h_mv.view(B_mv, 1)
-            target   = (pred_0 - h4 * dpred_dh).detach()
-            loss_mv  = nn.functional.mse_loss(pred_h, target)
+            # MeanFlow identity:  x̂_h + h·(∂x̂/∂h) = x
+            # Enforce directly against true x — NO stop-gradient, NO pred_0.
+            # The only finite solution to this ODE is x̂(h) = x for all h.
+            # This has NO degenerate fixed point: if model ignores h,
+            # loss = MSE(x̂(z,t), x) = FM loss ≠ 0, so it cannot cheat.
+            h4            = h_mv.view(B_mv, 1)
+            consistency   = pred_h + h4 * dpred_dh   # must equal x_mv
+            target_mv     = x_mv if pred_type == "x" else (eps_mv - x_mv)
+            loss_mv       = nn.functional.mse_loss(consistency, target_mv)
 
         except Exception as _e:
             tqdm.write(f"[MeanFlow] JVP fallback: {_e}")
