@@ -1031,7 +1031,7 @@ for ds_name in DATASETS:
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_every=5_000,
-        resume=True,
+        resume=False,
         run_name=run_name,
     )
     meanflow_models[ds_name] = mfm

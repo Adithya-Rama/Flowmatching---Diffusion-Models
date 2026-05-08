@@ -123,50 +123,50 @@ def meanflow_loss(
         v_true = eps_mv - x_mv
 
         try:
+            # ── FIX B: include h as a JVP primal so ∂_h is captured
             ones_t = torch.ones_like(t_mv)
+            ones_h = torch.ones_like(h_mv)
 
-            def _model_fn(t_in: torch.Tensor, z_in: torch.Tensor) -> torch.Tensor:
-                return model(z_in, t_in, h_mv)
+            def _model_fn(t_in, z_in, h_in):
+                return model(z_in, t_in, h_in)
 
             with torch.enable_grad():
-                u_mv, du_dt = torch.func.jvp(_model_fn, (t_mv, z_mv), (ones_t, v_true))
+                u_mv, du_dt = torch.func.jvp(
+                    _model_fn,
+                    (t_mv, z_mv, h_mv),
+                    (ones_t, v_true, ones_h),     # tangent (1, v_true, 1)
+                )
 
-            # ── Convert model output to velocity space
+            # ── Convert model output (x̂) to velocity space
             if pred_type == "x":
                 v_pred = (z_mv - u_mv) / t4_mv.clamp(min=t_eps)
                 dv_dt  = (v_true - du_dt) / t4_mv.clamp(min=t_eps) \
-                         - v_pred / t4_mv.clamp(min=t_eps)
+                        - v_pred / t4_mv.clamp(min=t_eps)
             else:
                 v_pred = u_mv
                 dv_dt  = du_dt
 
-            # ── FIX: get instantaneous velocity at h=0 for the target
-            # The paper (Eq.4) requires: target = sg[ v(h=0) + h · D_t u ]
-            # NOT sg[ u(h>0) + h · D_t u ] — that old form had D_t u = 0
-            # as a degenerate zero-cost solution, causing full model collapse.
+            # ── FIX C: instantaneous velocity at h=0 (not v_pred)
             with torch.no_grad():
                 h_zero_mv = torch.zeros_like(h_mv)
-                u_h0 = model(z_mv, t_mv, h_zero_mv)   # instantaneous pred at h=0
+                u_h0 = model(z_mv, t_mv, h_zero_mv)
                 if pred_type == "x":
                     v_h0 = (z_mv - u_h0) / t4_mv.clamp(min=t_eps)
                 else:
                     v_h0 = u_h0
 
-            # ── Self-consistency target using v_h0 (not v_pred)
+            # ── FIX A: MINUS sign per the MeanFlow Identity
             h4 = h_mv.view(B_mv, 1)
-            target_v = (v_h0 + h4 * dv_dt).detach()
+            target_v = (v_h0 - h4 * dv_dt).detach()
 
             loss_mv = nn.functional.mse_loss(v_pred, target_v)
 
         except Exception as _e:
             tqdm.write(f"[MeanFlow] JVP fallback: {_e}")
             pred_fallback = model(z_mv, t_mv, h_mv)
-            if pred_type == "x":
-                target_fb = x_mv
-            else:
-                target_fb = eps_mv - x_mv
+            target_fb = x_mv if pred_type == "x" else (eps_mv - x_mv)
             loss_mv = nn.functional.mse_loss(pred_fallback, target_fb)
-
+            
         losses.append(loss_mv)
 
     return sum(losses) / len(losses)
