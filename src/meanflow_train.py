@@ -1,30 +1,17 @@
 """
 MeanFlow training loop (Part 4).
 
-MeanFlow (arXiv 2505.13447) — paper Eq. 11 target:
-    u_target = v(z_t, t)  −  h · D_t[u_θ(z_t, t, h)]
-where v(z_t, t) is the instantaneous velocity.  During training on the linear
-interpolant z_t = (1−t)x + tε, that velocity is exactly  v_true = ε − x  (ground
-truth, NOT the model's h=0 output).  Using the model's own h=0 prediction as
-the target is a self-referential bootstrap that is unstable.
+This implementation uses the direct mean-velocity parameterization:
+    model(z_t, t, h) -> u_theta(z_t, t, h)
 
-x-prediction MeanFlow (best param from Part 2):
-    Mean velocity  u_θ = (z_t − x̂_θ)/t.  Plugging into Eq. 11 and using the
-    identity  z_t − t·v_true = x  (linear interpolant) gives:
+For the linear interpolant z_t = (1 - t) * x + t * eps, the instantaneous
+velocity is v_true = eps - x. MeanFlow trains a finite-horizon mean velocity
+with the identity:
+    u_target = v_true - h * d/dt u_theta(z_t(t), t, h(t))
 
-        x̂_target = x  +  t·h · D_t[(z_t − x̂_θ(h)) / t]
-
-    where D_t is the total time-derivative along dz/dt = v_true, computed via
-    JVP( λ(z,t)→(z − model(z,t,h))/t, (z_t,t), (v_true, 1) ).
-
-Sanity check (optimal straight-line flow x̂_θ ≡ x):
-    D_t[(z−x)/t] = D_t[v_true] = 0  ⇒  target = x  ✓
-
-v-prediction MeanFlow (else branch):
-    v̂_target = v_true  −  h · D_t v̂_θ(z_t, t, h)
-
-Training objective: half the batch trains the FM boundary (h=0); the other half
-trains MV consistency at h>0 (controlled by `fm_ratio`).
+The total derivative is computed with JVP tangents (dz/dt, dt/dt, dh/dt) =
+(v_true, 1, 1). The h tangent is essential because h = t - r and r is held
+fixed when differentiating with respect to t.
 """
 
 from __future__ import annotations
@@ -48,85 +35,79 @@ def meanflow_loss(
     model: nn.Module,
     x: torch.Tensor,
     *,
-    pred_type: str = "x",
+    pred_type: str = "v",
     fm_ratio: float = 0.5,
     device: str = "cpu",
     t_eps: float = T_EPS,
 ) -> torch.Tensor:
-    x    = x.to(device).float()
-    B, D = x.shape
+    pred_type = pred_type.lower()
+    if pred_type != "v":
+        raise ValueError(
+            "MeanFlow is configured for direct mean-velocity prediction; "
+            f"expected pred_type='v', got {pred_type!r}."
+        )
+    if not 0.0 <= fm_ratio <= 1.0:
+        raise ValueError(f"fm_ratio must be in [0, 1], got {fm_ratio}.")
+    if not 0.0 < t_eps < 0.5:
+        raise ValueError(f"t_eps must be in (0, 0.5), got {t_eps}.")
 
-    split  = max(1, int(B * fm_ratio))
-    losses = []
+    x = x.to(device).float()
+    B = x.shape[0]
 
-    # ── 1. FM term (h = 0): boundary condition  x̂(h=0) = x  (or v̂(h=0) = v_true)
+    split = max(1, min(B, int(B * fm_ratio)))
+    losses: list[torch.Tensor] = []
+
+    # 1. FM boundary term (h = 0): u_theta(z_t, t, 0) should match v_true.
     x_fm = x[:split]
     B_fm = x_fm.shape[0]
     if B_fm > 0:
         eps_fm = torch.randn_like(x_fm)
-        t_fm   = torch.rand(B_fm, device=device).clamp(t_eps, 1.0 - t_eps)
-        t4_fm  = t_fm.view(B_fm, 1)
-        z_fm   = (1.0 - t4_fm) * x_fm + t4_fm * eps_fm
+        t_fm = torch.rand(B_fm, device=device).clamp(t_eps, 1.0 - t_eps)
+        t4_fm = t_fm.view(B_fm, 1)
+        z_fm = (1.0 - t4_fm) * x_fm + t4_fm * eps_fm
         h_zero = torch.zeros(B_fm, device=device)
 
-        pred_fm   = model(z_fm, t_fm, h_zero)
-        target_fm = x_fm if pred_type == "x" else (eps_fm - x_fm)
+        pred_fm = model(z_fm, t_fm, h_zero)
+        target_fm = eps_fm - x_fm
         losses.append(F.mse_loss(pred_fm, target_fm))
 
-    # ── 2. MV consistency (h > 0): paper Eq. 11 with ground-truth v_true
+    # 2. Mean-velocity consistency term (h > 0): u = v_true - h * d_t u.
     if B - split > 0:
         x_mv = x[split:]
         B_mv = x_mv.shape[0]
         eps_mv = torch.randn_like(x_mv)
 
-        # Sample r ≤ t in [t_eps, 1−t_eps] by ordering two uniforms
-        u1   = torch.rand(B_mv, device=device)
-        u2   = torch.rand(B_mv, device=device)
-        t_mv = torch.maximum(u1, u2).clamp(t_eps, 1.0 - t_eps)
-        r_mv = torch.minimum(u1, u2).clamp(t_eps, 1.0 - t_eps)
+        # Sample r <= t in [t_eps, 1 - t_eps] by ordering two uniforms.
+        lo, hi = t_eps, 1.0 - t_eps
+        u1 = lo + (hi - lo) * torch.rand(B_mv, device=device)
+        u2 = lo + (hi - lo) * torch.rand(B_mv, device=device)
+        t_mv = torch.maximum(u1, u2)
+        r_mv = torch.minimum(u1, u2)
         h_mv = (t_mv - r_mv).clamp(min=t_eps)
 
         t4 = t_mv.view(B_mv, 1)
         h4 = h_mv.view(B_mv, 1)
-        z_mv   = (1.0 - t4) * x_mv + t4 * eps_mv
+        z_mv = (1.0 - t4) * x_mv + t4 * eps_mv
         v_true = (eps_mv - x_mv).detach()
 
-        pred_h = model(z_mv, t_mv, h_mv)  # tracked for backward
+        pred_h = model(z_mv, t_mv, h_mv)
 
-        ones_t = torch.ones(B_mv, device=device)
-        h_mv_d = h_mv.detach()
-        z_mv_d = z_mv.detach()
-        t_mv_d = t_mv.detach()
+        def _u_fn(z_in: torch.Tensor, t_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
+            return model(z_in, t_in, h_in)
 
-        try:
-            if pred_type == "x":
-                # u_θ = (z − x̂_θ)/t.  x̂_target = x + t·h·D_t[u_θ]
-                def _u_fn(z_in, t_in):
-                    x_hat = model(z_in, t_in, h_mv_d)
-                    return (z_in - x_hat) / t_in.unsqueeze(-1)
+        ones = torch.ones(B_mv, device=device)
+        _, du_dt = torch.func.jvp(
+            _u_fn,
+            (z_mv.detach(), t_mv.detach(), h_mv.detach()),
+            (v_true, ones, ones),
+        )
 
-                _, du_dt = torch.func.jvp(
-                    _u_fn, (z_mv_d, t_mv_d), (v_true, ones_t)
-                )
-                target = (x_mv + t4 * h4 * du_dt).detach()
-
-            else:  # v-prediction: v̂_target = v_true − h·D_t v̂_θ
-                def _v_fn(z_in, t_in):
-                    return model(z_in, t_in, h_mv_d)
-
-                _, dv_dt = torch.func.jvp(
-                    _v_fn, (z_mv_d, t_mv_d), (v_true, ones_t)
-                )
-                target = (v_true - h4 * dv_dt).detach()
-
-            losses.append(F.mse_loss(pred_h, target))
-
-        except Exception as _e:
-            tqdm.write(f"[MeanFlow] JVP fallback: {_e}")
-            target_fb = x_mv if pred_type == "x" else v_true
-            losses.append(F.mse_loss(pred_h, target_fb))
+        target = (v_true - h4 * du_dt).detach()
+        losses.append(F.mse_loss(pred_h, target))
 
     return sum(losses) / len(losses)
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -137,7 +118,7 @@ def train_meanflow(
     *,
     n_steps: int = 25_000,
     lr: float = 1e-3,
-    pred_type: str = "x",
+    pred_type: str = "v",
     fm_ratio: float = 0.5,
     warmup_frac: float = 0.0,
     t_eps: float = T_EPS,
@@ -149,18 +130,17 @@ def train_meanflow(
     log_every: int = 500,
 ) -> tuple[nn.Module, list[float]]:
     """
-    Train a MeanFlowMLP.
+    Train a direct mean-velocity MeanFlowMLP.
 
     Args:
         model           : MeanFlowMLP to train
         dataloader      : DataLoader over ToyDiffusionDataset
         n_steps         : total gradient steps
         lr              : Adam learning rate
-        pred_type       : 'v' or 'x'
+        pred_type       : must be 'v'
         fm_ratio        : fraction of each batch for standard FM (h=0) after warmup
-        warmup_frac     : fraction of steps to train FM-only before MV consistency;
-                          e.g. 0.4 means first 40% of steps use fm_ratio=1.0
-        t_eps           : clamp t to [t_eps, 1-t_eps] for numerical stability
+        warmup_frac     : fraction of steps to train FM-only before MV consistency
+        t_eps           : clamp t to [t_eps, 1 - t_eps] for numerical stability
         device          : torch device
         checkpoint_dir  : directory for saving checkpoints
         checkpoint_every: save frequency in steps
@@ -171,6 +151,13 @@ def train_meanflow(
     Returns:
         (trained model, loss_history)
     """
+    pred_type = pred_type.lower()
+    if pred_type != "v":
+        raise ValueError(
+            "train_meanflow only supports direct mean-velocity pred_type='v'; "
+            f"got {pred_type!r}."
+        )
+
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -178,7 +165,6 @@ def train_meanflow(
     loss_history: list[float] = []
     warmup_steps = int(n_steps * warmup_frac)
 
-    # ── Resume ───────────────────────────────────────────────────────────
     if checkpoint_dir is not None:
         ckpt_path = Path(checkpoint_dir) / run_name / "latest.pt"
         if resume and ckpt_path.exists():
@@ -186,7 +172,7 @@ def train_meanflow(
             ckpt = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
-            start_step   = ckpt["step"]
+            start_step = ckpt["step"]
             loss_history = ckpt.get("loss_history", [])
             print(f"[Resume] Continuing from step {start_step}/{n_steps}")
 
@@ -194,7 +180,6 @@ def train_meanflow(
         print(f"[Skip] MeanFlow already trained to {start_step} steps.")
         return model, loss_history
 
-    # ── Training loop ────────────────────────────────────────────────────
     model.train()
     data_iter = iter(dataloader)
 
@@ -212,7 +197,7 @@ def train_meanflow(
             data_iter = iter(dataloader)
             x = next(data_iter)
 
-        # Pure FM warmup: ignore h-dependence until FM sub-term has converged
+        # Pure FM warmup: first learn the h=0 velocity boundary cleanly.
         current_fm_ratio = 1.0 if step < warmup_steps else fm_ratio
 
         optimizer.zero_grad()
@@ -266,9 +251,9 @@ def _save_ckpt(
     path = Path(checkpoint_dir) / run_name
     path.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "model_state":     model.state_dict(),
+        "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "step":            step,
-        "loss_history":    loss_history,
+        "step": step,
+        "loss_history": loss_history,
     }, path / "latest.pt")
-    tqdm.write(f"[Checkpoint] MeanFlow saved at step {step}  →  {path / 'latest.pt'}")
+    tqdm.write(f"[Checkpoint] MeanFlow saved at step {step} -> {path / 'latest.pt'}")

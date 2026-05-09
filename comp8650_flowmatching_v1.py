@@ -270,7 +270,7 @@ truth for all 3 datasets at D=2.
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 25_000
+N_STEPS    = 25_000 #25000
 LR         = 1e-3 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
@@ -1027,10 +1027,10 @@ $$u_\theta(z_t,\, t,\, h) \;\approx\; \frac{1}{h}\int_{r}^{t} v(z_s,s)\, ds$$
 This enables **single-step generation** via $z_r = z_t - h \cdot u_\theta(z_t, t, h)$.
 
 **Training (self-consistency condition):**
-$$\mathcal{L} = \left\| u_\theta(z_t,t,h) - \text{sg}\!\left[ v_\theta(z_t,t) + h \cdot \frac{d}{dt}u_\theta(z_t(t),t,h) \right] \right\|^2$$
+$$\mathcal{L} = \left\| u_\theta(z_t,t,h) - \text{sg}\!\left[ v_{\text{true}}(z_t,t) - h \cdot \frac{d}{dt}u_\theta(z_t(t),t,h(t)) \right] \right\|^2$$
 
 The time derivative $\frac{d}{dt}u_\theta$ is computed via **JVP**:
-$$\frac{d}{dt}u_\theta(z_t(t),t,h) = \text{JVP}\!\left(u_\theta,\; (z_t, t),\; (v_{\text{true}}, 1)\right)$$
+$$\frac{d}{dt}u_\theta(z_t(t),t,h(t)) = \text{JVP}\!\left(u_\theta,\; (z_t, t, h),\; (v_{\text{true}}, 1, 1)\right)$$
 
 The training mixes 50% standard FM (h=0) with 50% mean-velocity consistency (h>0).
 
@@ -1042,18 +1042,26 @@ so the input is $[z_t;\, e_t;\, e_h] \in \mathbb{R}^{D+256}$.
 
 # §4.2  Train MeanFlow models on all 3 datasets at D=32
 # ──────────────────────────────────────────────────────────────────────────────
-# x-prediction (best from Part 2). MV consistency target uses ground-truth
-# v_true (paper Eq. 11), not the model's own h=0 prediction.
+# We use direct mean-velocity v/v MeanFlow for the strongest 1-step samples.
+# Training: 200K steps with an FM-only warmup and t_eps=1e-2.
 
-MF_PRED_TYPE = 'x'
+MF_PRED_TYPE = 'v'
 MF_DIM       = 32
-MF_N_STEPS   = 25_000
+MF_N_STEPS   = 200_000
+MF_T_EPS     = 1e-2
+MF_WARMUP_FRAC = 0.4
+MF_RUN_TAG   = 'vv_200k_teps1e2_warm04'
+BATCH_SIZE = 1024
+LR         = 1e-3 #1e-3
+N_ODE_STEPS = 50
+HIDDEN_DIM  = 256
+TIME_EMB_DIM = 128
 
 meanflow_models = {}
 meanflow_losses = {}
 
 for ds_name in DATASETS:
-    run_name = f'p4_meanflow_{ds_name}_d{MF_DIM}'
+    run_name = f'p4_meanflow_{MF_RUN_TAG}_{ds_name}_d{MF_DIM}'
     print(f"\n{'='*55}\nMeanFlow: {ds_name}  D={MF_DIM}  pred={MF_PRED_TYPE}")
 
     dl     = get_dataloader(ds_name, dim=MF_DIM, batch_size=BATCH_SIZE,
@@ -1066,9 +1074,11 @@ for ds_name in DATASETS:
         n_steps=MF_N_STEPS, lr=LR,
         pred_type=MF_PRED_TYPE,
         fm_ratio=0.5,
+        warmup_frac=MF_WARMUP_FRAC,
+        t_eps=MF_T_EPS,
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
-        checkpoint_every=5_000,
+        checkpoint_every=10_000,
         resume=False,
         run_name=run_name,
     )
@@ -1088,13 +1098,15 @@ for ds_name in DATASETS:
 from model import MeanFlowMLP
 from train import load_checkpoint
 
-MF_PRED_TYPE = 'x'   # MeanFlow uses Part 2's best (x-prediction)
-FM_PRED_TYPE = 'x'   # FM comparison model uses same (Part 2 best)
+MF_PRED_TYPE = 'v'   # MeanFlow direct mean-velocity prediction type
+FM_PRED_TYPE = 'x'   # FM comparison model prediction type (Part 2 best)
 MF_DIM = 32
+MF_T_EPS = 1e-2
+MF_RUN_TAG = 'vv_200k_teps1e2_warm04'
 
 meanflow_models = {}
 for ds_name in DATASETS:
-    run_name = f'p4_meanflow_{ds_name}_d{MF_DIM}'
+    run_name = f'p4_meanflow_{MF_RUN_TAG}_{ds_name}_d{MF_DIM}'
     mfm = MeanFlowMLP(data_dim=MF_DIM, hidden_dim=HIDDEN_DIM,
                       time_emb_dim=TIME_EMB_DIM)
     mfm, _, _ = load_checkpoint(mfm, CHECKPOINT_DIR, run_name, device=DEVICE)
@@ -1139,7 +1151,7 @@ for ds_name in DATASETS:
     mf_samples = {}
     for nfe in MF_STEP_COUNTS:
         gen = meanflow_sample(mfm, N_SAMPLES, MF_DIM, n_steps=nfe, pred_type=MF_PRED_TYPE,
-                              device=DEVICE, seed=42)
+                              device=DEVICE, t_eps=MF_T_EPS, seed=42)
         mf_samples[nfe] = ds.to_2d(gen)
 
     # Standard FM samples at various steps (FM model uses FM_PRED_TYPE='x')
@@ -1178,14 +1190,16 @@ print("\nPart 4.2 visualisations complete ✓")
 
 """### §4.3  Analysis Questions
 
-**Q1 (2 marks): Why did you choose x-prediction for MeanFlow?**
+**Q1 (2 marks): Why did you choose v-prediction for MeanFlow?**
 
-> We chose **x-prediction** based on the Part 2 finding that x-prediction
-> is the only parameterisation that scales successfully to high ambient dimensions
-> (D=8, D=32). MeanFlow is most useful at higher dimensions where single-step
-> generation is needed, so using the parameterisation that works reliably at D=32
-> is the natural choice. v-prediction fails at D≥32, meaning any MeanFlow model
-> built on v-prediction would be starting from a broken base.
+> Although x/x was the strongest standard FM baseline at D=32, this MeanFlow
+> experiment uses **direct v/v mean-velocity prediction** because the MeanFlow
+> identity is naturally expressed in velocity space:
+> $$u_\theta = v_{\text{true}} - h\,\partial_t u_\theta.$$
+> This lets the model predict the finite-horizon average velocity directly,
+> avoiding an extra x-to-v conversion inside the MeanFlow target. We still compare
+> against the x/x FM baseline because that remains the best multi-step FM model
+> from Part 2.
 
 **Q2 (4 marks): Core idea of MeanFlow — what does it learn differently?**
 
@@ -1213,11 +1227,10 @@ print("\nPart 4.2 visualisations complete ✓")
 > i.e. the mean velocity at zero horizon equals the instantaneous velocity.
 > This is the **boundary condition** for the self-consistency ODE.
 >
-> Without this anchor, the $h>0$ self-consistency condition
-> $u = v + h \cdot \partial_t u$ would be homogeneous (all-zero is a trivial
-> solution). The $h=0$ boundary term provides the initial condition that drives
-> the mean velocity to match the true flow, making the $h>0$ solutions
-> non-trivial and physically meaningful.
+> Without this anchor, the $h>0$ self-consistency target depends strongly on the
+> model's own derivative and can drift during bootstrapping. The $h=0$ boundary
+> term provides a supervised velocity anchor, making the larger-horizon solutions
+> stable and physically meaningful.
 
 **Q4 (3 marks): Training cost comparison — why is MeanFlow harder?**
 

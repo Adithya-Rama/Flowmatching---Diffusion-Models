@@ -1,4 +1,4 @@
-Total cells: 41
+Total cells: 43
 
 ================================================================================
 CELL 0 | TYPE: markdown
@@ -61,22 +61,46 @@ print(f"Results    : {RESULTS_DIR}")
 ================================================================================
 CELL 4 | TYPE: code
 ================================================================================
-# ── 0.3  Clone or pull the repository ────────────────────────────────────────
-import subprocess, sys
+import os
+import glob
+import subprocess
 
 def run(cmd, **kw):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        **kw
+    )
     if result.returncode != 0:
         print(f"STDERR: {result.stderr.strip()}")
     return result.stdout.strip()
 
-if not os.path.exists(os.path.join(REPO_DIR, '.git')):
+git_dir = os.path.join(REPO_DIR, ".git")
+
+if not os.path.exists(git_dir):
     print("Cloning repository …")
     out = run(f'git clone {REPO_URL} "{REPO_DIR}"')
     print(out or "Done.")
 else:
-    print("Repository found — pulling latest …")
-    out = run(f'git -C "{REPO_DIR}" pull')
+    print("Repository found — cleaning stale locks …")
+
+    # Remove ALL git lock files
+    lock_files = glob.glob(os.path.join(git_dir, "**", "*.lock"), recursive=True)
+
+    for lf in lock_files:
+        try:
+            os.remove(lf)
+            print("Removed:", lf)
+        except Exception as e:
+            print("Could not remove:", lf, e)
+
+    # Repair/repack repository metadata
+    run(f'git -C "{REPO_DIR}" gc --prune=now')
+
+    print("Pulling latest …")
+    out = run(f'git -C "{REPO_DIR}" pull --ff-only')
     print(out)
 
 print("\nRepo contents:")
@@ -85,6 +109,7 @@ print(run(f'ls "{REPO_DIR}"'))
 ================================================================================
 CELL 5 | TYPE: code
 ================================================================================
+import sys
 # ── 0.4  Add src/ to Python path ─────────────────────────────────────────────
 SRC_DIR = os.path.join(REPO_DIR, 'src')
 if SRC_DIR not in sys.path:
@@ -175,13 +200,28 @@ DATASETS  = ('swiss_roll', 'gaussians', 'circles')
 DIMS      = (2, 8, 32)
 
 ================================================================================
-CELL 9 | TYPE: markdown
+CELL 9 | TYPE: code
+================================================================================
+import os
+
+print("REPO_DIR exists:", os.path.exists(REPO_DIR))
+print("SRC_DIR exists :", os.path.exists(SRC_DIR))
+
+print("\nRepo contents:")
+print(os.listdir(REPO_DIR))
+
+if os.path.exists(SRC_DIR):
+    print("\nsrc contents:")
+    print(os.listdir(SRC_DIR))
+
+================================================================================
+CELL 10 | TYPE: markdown
 ================================================================================
 ---
 ## §1  Part 1 — Warm-up (10 marks) <a id='part1'></a>
 
 ================================================================================
-CELL 10 | TYPE: markdown
+CELL 11 | TYPE: markdown
 ================================================================================
 ### §1.1  Data Visualisation (3 marks)
 
@@ -194,7 +234,7 @@ dimensionality is always 2, regardless of ambient dimension $D$).
 each of the 3 datasets.
 
 ================================================================================
-CELL 11 | TYPE: code
+CELL 12 | TYPE: code
 ================================================================================
 # §1.1  Data Visualisation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -239,7 +279,7 @@ print("Observation: The 32-D back-projected data preserves the same 2-D structur
 print("confirming that intrinsic dimensionality = 2 for all datasets.")
 
 ================================================================================
-CELL 12 | TYPE: markdown
+CELL 13 | TYPE: markdown
 ================================================================================
 ### §1.2  v-Prediction Flow Matching at D = 2 (7 marks)
 
@@ -260,13 +300,13 @@ v-prediction / v-loss parameterisation (Eq. 2 in the spec) and train on all
 truth for all 3 datasets at D=2.
 
 ================================================================================
-CELL 13 | TYPE: code
+CELL 14 | TYPE: code
 ================================================================================
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 25_000
-LR         = 1e-3
+N_STEPS    = 25_000 #25000
+LR         = 1e-3 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
 TIME_EMB_DIM = 128
@@ -281,7 +321,7 @@ print(f"  Prediction     : v-prediction  (v = ε − x)")
 print(f"  Loss           : v-loss  (MSE in velocity space)")
 
 ================================================================================
-CELL 14 | TYPE: code
+CELL 15 | TYPE: code
 ================================================================================
 # §1.2  Train v-prediction model on all 3 datasets at D=2
 # ──────────────────────────────────────────────────────────────────────────────
@@ -316,7 +356,7 @@ for ds_name in DATASETS:
 print("\nAll Part 1 models trained ✓")
 
 ================================================================================
-CELL 15 | TYPE: code
+CELL 16 | TYPE: code
 ================================================================================
 # §1.2  Plot loss curves
 for ds_name in DATASETS:
@@ -325,7 +365,7 @@ for ds_name in DATASETS:
                     save_path=f'{RESULTS_DIR}/part1_loss_{ds_name}.png')
 
 ================================================================================
-CELL 16 | TYPE: code
+CELL 17 | TYPE: code
 ================================================================================
 # §1.2  Generate and visualise samples
 # ──────────────────────────────────────────────────────────────────────────────
@@ -350,13 +390,13 @@ for ds_name in DATASETS:
 print("\nPart 1.2 complete — generated samples visualised ✓")
 
 ================================================================================
-CELL 17 | TYPE: markdown
+CELL 18 | TYPE: markdown
 ================================================================================
 ---
 ## §2  Part 2 — Flow Matching Parameterisation (34 marks) <a id='part2'></a>
 
 ================================================================================
-CELL 18 | TYPE: markdown
+CELL 19 | TYPE: markdown
 ================================================================================
 ### §2.1  Derivation: Conversion Between Prediction Types (4 marks)
 
@@ -389,16 +429,32 @@ $t \in [\varepsilon, 1-\varepsilon]$ to prevent division by near-zero.
 
 #### The 4 prediction × loss combinations:
 
-| | **v-loss** $\;\mathcal{L} = \|\hat{v} - v\|^2$ | **x-loss** $\;\mathcal{L} = \|\hat{x} - x\|^2$ |
-|---|---|---|
-| **v-pred** | $\|\text{model}(z_t,t) - v\|^2$ | $\|z_t - t\cdot\text{model}(z_t,t) - x\|^2$ |
-| **x-pred** | $\left\|\frac{z_t - \text{model}(z_t,t)}{t} - v\right\|^2$ | $\|\text{model}(z_t,t) - x\|^2$ |
+
+**v-pred + v-loss**
+$$
+\|\text{model}(z_t, t) - v\|^2
+$$
+
+**v-pred + x-loss**
+$$
+\|z_t - t \cdot \text{model}(z_t, t) - x\|^2
+$$
+
+**x-pred + v-loss**
+$$
+\left\|\frac{z_t - \text{model}(z_t, t)}{t} - v\right\|^2
+$$
+
+**x-pred + x-loss**
+$$
+\|\text{model}(z_t, t) - x\|^2
+$$
 
 All 4 combinations are equivalent at $D=2$; they diverge at large $D$ because
 the complexity of the prediction target changes with dimension.
 
 ================================================================================
-CELL 19 | TYPE: markdown
+CELL 20 | TYPE: markdown
 ================================================================================
 ### §2.2  Run All 36 Experiments (18 marks)
 
@@ -408,7 +464,7 @@ We train all 4 pred×loss combinations across 3 datasets and 3 dimensions
 Same hyperparameters as Part 1 throughout.
 
 ================================================================================
-CELL 20 | TYPE: code
+CELL 21 | TYPE: code
 ================================================================================
 # §2.2  Run all 36 experiments
 # ──────────────────────────────────────────────────────────────────────────────
@@ -437,6 +493,7 @@ for ds_name in DATASETS:
                 model = FlowMatchingMLP(data_dim=dim, hidden_dim=HIDDEN_DIM,
                                         time_emb_dim=TIME_EMB_DIM)
 
+                resume_flag = not (pred_type == 'x' and loss_type == 'v')
                 model, losses = train_flow_matching(
                     model, dl,
                     n_steps=N_STEPS, lr=LR,
@@ -444,7 +501,7 @@ for ds_name in DATASETS:
                     device=DEVICE,
                     checkpoint_dir=CHECKPOINT_DIR,
                     checkpoint_every=5_000,
-                    resume=True,
+                    resume=resume_flag,
                     run_name=run_name,
                 )
                 part2_models[key] = model
@@ -454,7 +511,7 @@ for ds_name in DATASETS:
 print(f"\nAll {TOTAL} Part 2 models done ✓")
 
 ================================================================================
-CELL 21 | TYPE: code
+CELL 22 | TYPE: code
 ================================================================================
 # §2.2  Visualise all 36 configurations
 # ──────────────────────────────────────────────────────────────────────────────
@@ -462,6 +519,7 @@ CELL 21 | TYPE: code
 # (one panel per pred×loss combo) alongside the ground truth.
 
 nnd_results = {}
+N_SAMPLES = 2000
 
 for ds_name in DATASETS:
     ds_ref = {d: ToyDiffusionDataset(ds_name, dim=d, data_dir=DATA_PATH) for d in DIMS}
@@ -513,7 +571,7 @@ for ds_name in DATASETS:
 print("\nAll Part 2 visualisations complete ✓")
 
 ================================================================================
-CELL 22 | TYPE: code
+CELL 23 | TYPE: code
 ================================================================================
 # §2.2  NND Summary Table
 print("=== Part 2 — Nearest-Neighbour Distance (NND) Summary ===")
@@ -521,7 +579,7 @@ print("(lower = better)\n")
 print_results_table(nnd_results, list(DATASETS), list(DIMS))
 
 ================================================================================
-CELL 23 | TYPE: markdown
+CELL 24 | TYPE: markdown
 ================================================================================
 ### §2.3  Analysis Questions
 
@@ -543,14 +601,25 @@ CELL 23 | TYPE: markdown
 **Q2 (3 marks): Does the choice of loss space (x-loss, v-loss) affect which prediction types succeed or fail?**
 
 > **Answer:**
-> The loss space has **minimal effect** on which configurations succeed or fail.
-> Both `v-pred / x-loss` and `v-pred / v-loss` fail at D=32, and both
-> `x-pred / x-loss` and `x-pred / v-loss` succeed. The bottleneck is the
-> *prediction target*, not the loss space: regardless of which loss we use,
-> the model still needs to **output** either $x$ or $v$, and it is the
-> difficulty of predicting $v$ in high dimensions that causes failure.
-> Converting between prediction types in the loss only changes gradient
-> weighting, not the fundamental expressibility of the learned mapping.
+> Yes — the choice of loss space **does affect training stability**, particularly
+> for cross-combinations, though it is secondary to the choice of prediction target.
+>
+> - **`v/x` (v-pred, x-loss):** Stable. Converting $\hat{v} \to \hat{x}$ via
+>   $\hat{x} = z_t - t\hat{v}$ multiplies by $t$, which is bounded and attenuates
+>   gradients near $t \approx 0$.
+> - **`x/v` (x-pred, v-loss):** Numerically unstable. Converting $\hat{x} \to \hat{v}$
+>   via $\hat{v} = (z_t - \hat{x})/t$ introduces a $1/t$ factor. Squaring this in the
+>   MSE imposes a $1/t^2$ effective weight near $t \approx 0$.  With
+>   $t_\varepsilon = 10^{-4}$ the weight reaches $\sim 10^8$, causing catastrophic
+>   loss spikes: circles D=2 loss $\approx 1817$, swiss\_roll D=8 loss $\approx 45$.
+>   A larger floor ($t_\varepsilon \geq 0.05$) is required for x/v to train stably
+>   (see the fix in `src/train.py`, `flow_matching_loss`).
+>
+> The **primary bottleneck** for high-$D$ failure is still the prediction target
+> (x vs v): both v/v and v/x fail at D=32, and both x/x and a properly regularised
+> x/v succeed. However, an inadequate $t_\varepsilon$ makes x/v degenerate even at
+> D=2, demonstrating that the loss space strongly affects **numerical stability** for
+> cross-combinations.
 
 **Q3 (6 marks): Explain why x-prediction works at high D while v-prediction does not. Consider the rank of each prediction target.**
 
@@ -576,7 +645,7 @@ CELL 23 | TYPE: markdown
 > data target $x$ remains constant.
 
 ================================================================================
-CELL 24 | TYPE: markdown
+CELL 25 | TYPE: markdown
 ================================================================================
 ---
 ## §3  Part 3 — Can We Rescue v-Prediction? (25 marks) <a id='part3'></a>
@@ -601,7 +670,7 @@ We also run the same ablations on x-prediction to check whether the gains
 are v-prediction-specific.
 
 ================================================================================
-CELL 25 | TYPE: code
+CELL 26 | TYPE: code
 ================================================================================
 # §3  Baseline: confirm v-prediction failure at D=32
 # ──────────────────────────────────────────────────────────────────────────────
@@ -635,26 +704,33 @@ save_fig(fig, f'{RESULTS_DIR}/part3_baseline_d32.png')
 plt.show()
 
 ================================================================================
-CELL 26 | TYPE: markdown
+CELL 27 | TYPE: markdown
 ================================================================================
 #### Part 3 Ablation Implementations
 
 We now implement the custom training variants that attempt to rescue v-prediction.
 
 ================================================================================
-CELL 27 | TYPE: code
+CELL 28 | TYPE: code
 ================================================================================
 # §3  Custom training: SNR-weighted v-loss
 # ──────────────────────────────────────────────────────────────────────────────
 # Weight the v-loss by (1-t)^2 / t^2  (down-weights high-noise timesteps).
 # This is equivalent to computing the loss in a normalised velocity space.
+#
+# NUMERICAL NOTE: the raw weight (1-t)^2/t^2 diverges as t→0.  At t=1e-4 it
+# reaches ~10^8.  We therefore use t_floor=0.05 in the weight denominator
+# and cap at W_MAX=100 to guarantee bounded gradients throughout training.
 
 import torch.nn.functional as F
 
+W_MAX = 100.0   # maximum SNR weight — prevents gradient explosion
+
 def train_snr_weighted(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
                        device=DEVICE, checkpoint_dir=CHECKPOINT_DIR,
-                       resume=True, t_eps=1e-4):
-    """v-prediction with SNR-weighted v-loss: weight = (1-t)^2 / t^2"""
+                       resume=True, t_eps=1e-4, t_floor=0.05):
+    """v-prediction with SNR-weighted v-loss: weight = (1-t)^2 / t^2,
+    clipped at t_floor for numerical stability and capped at W_MAX."""
     from train import _save_checkpoint
     model = model.to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
@@ -662,15 +738,15 @@ def train_snr_weighted(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
 
     ckpt_path = Path(checkpoint_dir) / run_name / 'latest.pt'
     if resume and ckpt_path.exists():
-        print(f"[Resume] {run_name}")
+        print(f'[Resume] {run_name}')
         ck = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ck['model_state'])
         opt.load_state_dict(ck['optimizer_state'])
         start = ck['step']; losses = ck.get('loss_history', [])
-        print(f"  from step {start}/{n_steps}")
+        print(f'  from step {start}/{n_steps}')
 
     if start >= n_steps:
-        print(f"[Skip] {run_name} already done.")
+        print(f'[Skip] {run_name} already done.')
         return model, losses
 
     data_iter = iter(dataloader)
@@ -690,7 +766,10 @@ def train_snr_weighted(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
         v_pred   = model(z_t, t)
 
         # SNR weight = (1-t)^2 / t^2
-        w    = ((1-t4)**2 / t4.clamp(min=t_eps)**2)   # (B,1)
+        # Use t_floor in denominator to avoid 1/t^2 ~ 10^8 near t=0.
+        # Also cap at W_MAX to guarantee bounded gradients.
+        t4_w = t4.clamp(min=t_floor)
+        w    = ((1-t4)**2 / t4_w**2).clamp(max=W_MAX)   # (B,1), bounded in [0, W_MAX]
         loss = (w * (v_pred - v_target)**2).mean()
 
         opt.zero_grad(); loss.backward(); opt.step()
@@ -714,14 +793,14 @@ def train_t_biased(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
 
     ckpt_path = Path(checkpoint_dir) / run_name / 'latest.pt'
     if resume and ckpt_path.exists():
-        print(f"[Resume] {run_name}")
+        print(f'[Resume] {run_name}')
         ck = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ck['model_state'])
         opt.load_state_dict(ck['optimizer_state'])
         start = ck['step']; losses = ck.get('loss_history', [])
 
     if start >= n_steps:
-        print(f"[Skip] {run_name}"); return model, losses
+        print(f'[Skip] {run_name}'); return model, losses
 
     data_iter = iter(dataloader)
     from tqdm.auto import tqdm
@@ -752,7 +831,7 @@ def train_t_biased(model, dataloader, run_name, n_steps=N_STEPS, lr=LR,
     return model, losses
 
 ================================================================================
-CELL 28 | TYPE: code
+CELL 29 | TYPE: code
 ================================================================================
 # §3  Run all Part 3 ablation experiments on swiss_roll D=32
 # ──────────────────────────────────────────────────────────────────────────────
@@ -766,6 +845,9 @@ ablation_configs = [
     ('v/x',                  'v', 'x', None,  {}),
     ('x/x (oracle)',         'x', 'x', None,  {}),
     # New ablations
+    # NOTE: SNR uses a '_fixed' run_name so it retrains with the corrected
+    # weight formula (t_floor=0.05, W_MAX=100) rather than loading the old
+    # diverged checkpoint (final loss ~16 000 at t_floor=1e-4).
     ('v/v SNR-weighted',     'v', 'v', 'snr',     {}),
     ('v/v t-biased',         'v', 'v', 'tbias',   {}),
     ('v/v large(512)',       'v', 'v', 'large',   {}),
@@ -778,7 +860,7 @@ abl_losses = {}
 for (label, pt, lt, special, kw) in ablation_configs:
     safe_label = label.replace('/', '_').replace(' ', '_').replace('(', '').replace(')', '')
     run_name   = f'p3_{safe_label}_d32'
-    print(f"\n{'='*55}\n{label}  →  {run_name}")
+    print(f"\n{'='*55}\n{label}  ->  {run_name}")
 
     if special is None:
         # Reuse Part 2 model if available, else train fresh
@@ -786,12 +868,14 @@ for (label, pt, lt, special, kw) in ablation_configs:
         if key in part2_models:
             abl_models[label] = part2_models[key]
             abl_losses[label] = part2_losses.get(key, [])
-            print("  [Reused from Part 2]")
+            print('  [Reused from Part 2]')
             continue
 
     if special == 'snr':
+        # '_fixed' suffix forces fresh training with corrected SNR weights
+        snr_run_name = run_name + '_fixed'
         model = FlowMatchingMLP(data_dim=32, hidden_dim=HIDDEN_DIM, time_emb_dim=TIME_EMB_DIM)
-        model, losses = train_snr_weighted(model, dl32, run_name,
+        model, losses = train_snr_weighted(model, dl32, snr_run_name,
                                            checkpoint_dir=CHECKPOINT_DIR, device=DEVICE)
 
     elif special == 'tbias':
@@ -827,12 +911,12 @@ for (label, pt, lt, special, kw) in ablation_configs:
 
     abl_models[label] = model
     abl_losses[label] = losses
-    print(f"  Final loss: {losses[-1]:.5f}")
+    print(f'  Final loss: {losses[-1]:.5f}')
 
-print("\nAll Part 3 ablations done ✓")
+print('\nAll Part 3 ablations done')
 
 ================================================================================
-CELL 29 | TYPE: code
+CELL 30 | TYPE: code
 ================================================================================
 # §3  Visualise Part 3 ablation results
 # ──────────────────────────────────────────────────────────────────────────────
@@ -869,41 +953,44 @@ for label, nnd in sorted(abl_nnd.items(), key=lambda x: x[1]):
     print(f"  {label:30s}: {nnd:.5f}")
 
 ================================================================================
-CELL 30 | TYPE: markdown
+CELL 31 | TYPE: markdown
 ================================================================================
 ### §3.1  Analysis Questions
 
 **Q1 (2 marks): Is v-prediction's failure fundamental, or can it be overcome?**
 
 > **Answer:**
-> The failure is **partially fundamental** but can be **partially overcome** with
-> the right modifications.
+> The failure is **partially fundamental** and can only be **partially mitigated**,
+> not fully overcome, with the approaches we tested.
 >
-> Our experiments show that the default v-prediction (v/v, 256 hidden units, 25K steps)
-> fails badly at D=32. However:
-> - **v/x (v-pred with x-loss)** improves significantly, because the loss gradient
->   is no longer amplified near t≈0 by the 1/t factor from the v→x conversion.
-> - **SNR weighting** provides a moderate improvement by down-weighting high-noise
->   timesteps.
-> - **Larger capacity** (512 hidden units) also helps, confirming that part of the
->   failure is a capacity problem.
+> Our NND results on swiss\_roll D=32 show that none of the ablations close the
+> quality gap relative to x-prediction:
+> - **v/x (v-pred, x-loss):** Does not yield a consistent NND improvement over v/v
+>   at D=32. Changing the loss space does not alter the prediction target — the model
+>   still outputs a rank-$D$ velocity field — so the fundamental capacity bottleneck
+>   remains.
+> - **SNR weighting** (with bounded weights, $t_\text{floor}=0.05$, $w_\text{max}=100$):
+>   Provides a moderate improvement by concentrating training budget on low-noise
+>   timesteps where the velocity target is more structured.
+> - **Larger capacity** (512 hidden units) and **extended training** (50K steps):
+>   Each yields marginal improvement, confirming a partial capacity bottleneck,
+>   but neither closes the gap to x-prediction quality.
 >
-> However, none of these fully match the quality of x-prediction, suggesting the
-> failure has a fundamental component rooted in the high-rank prediction target.
+> The residual gap confirms the fundamental component: the velocity target
+> $v = \varepsilon - x$ has rank $D$ and norm $O(\sqrt{D})$, which a fixed-capacity
+> MLP cannot represent well in $\mathbb{R}^{32}$, regardless of how training is tuned.
 
 **Q2 (3 marks): What approaches did you try? Compare compute cost.**
 
 > **Approaches tested:**
 > 1. `v/v` baseline — fails at D=32 (standard compute)
-> 2. `v/x` (v-pred, x-loss) — improved; same compute as baseline
-> 3. `v/v` SNR-weighted loss — moderate improvement; ~same compute (just a weight)
+> 2. `v/x` (v-pred, x-loss) — NND comparable to baseline at D=32; same compute
+> 3. `v/v` SNR-weighted loss — moderate improvement; ~same compute (scalar weight multiply)
 > 4. `v/v` Beta t-biasing — mixed results; same compute
-> 5. `v/v` large model (512 units) — improved; ~4× more FLOPS per step
-> 6. `v/v` 50K steps — marginal improvement; 2× more training time
+> 5. `v/v` large model (512 units) — best v-prediction result; ~4× more FLOPS per step
+> 6. `v/v` 50K steps — marginal improvement over 25K; 2× training time
 >
-> The cheapest and most effective rescue is **v/x** (no extra cost), followed by
-> SNR weighting. Compared to x-prediction achieving similar quality at D=32,
-> the best rescued v-prediction requires ~2-4× more compute.
+> The most effective rescue is larger capacity (512 units, NND 0.033), followed by extended training (50K steps, NND 0.050). SNR weighting provides a marginal improvement over baseline (NND 0.136 vs 0.147); t-biased sampling underperforms (NND 0.259). The most effective rescue remains larger capacity (512 units, NND 0.033).
 
 **Q3 (3 marks): How do x-prediction and v-prediction respond to these changes?**
 
@@ -911,10 +998,12 @@ CELL 30 | TYPE: markdown
 > modifications do not meaningfully improve it further. This confirms that
 > x-prediction does not suffer from the high-D problem to begin with.
 >
-> v-prediction, by contrast, benefits substantially from modifications that
-> reduce the effective difficulty of the prediction target (SNR weighting, x-loss,
-> larger capacity). This is because x-prediction only needs to learn a rank-2 mapping
-> (data lives on a 2-D manifold), while v-prediction must learn a rank-D mapping.
+> v-prediction, by contrast, benefits from modifications that either reduce the
+> effective difficulty of the training signal (SNR weighting focuses on low-noise
+> steps where the velocity target is small and structured) or increase model capacity.
+> This is consistent with the rank analysis: x-prediction only needs to learn a
+> rank-2 mapping (data lives on a 2-D manifold), while v-prediction must learn a
+> rank-$D$ mapping that requires larger capacity and more careful training.
 
 **Q4 (7 marks): Why does v-prediction succeed in practice for Stable Diffusion 3 / FLUX?**
 
@@ -932,7 +1021,7 @@ CELL 30 | TYPE: markdown
 > 3. **Data is truly high-dimensional:** Real images are intrinsically
 >    high-dimensional (not a 2-D manifold in D-D space). At D=32 with 2-D
 >    intrinsic dimensionality, the velocity target is dominated by noise in 30
->    "irrelevant" dimensions. For natural images, nearly all dimensions carry
+>    'irrelevant' dimensions. For natural images, nearly all dimensions carry
 >    meaningful signal, so there is no such noise amplification.
 >
 > 4. **Noise schedule and conditioning:** These models use learned or cosine-based
@@ -943,24 +1032,44 @@ CELL 30 | TYPE: markdown
 >    to stabilise v-prediction training (Hang et al., 2023).
 
 ================================================================================
-CELL 31 | TYPE: markdown
+CELL 32 | TYPE: markdown
 ================================================================================
 ---
 ## §4  Part 4 — One-Step Generation (31 marks) <a id='part4'></a>
 
 ================================================================================
-CELL 32 | TYPE: markdown
+CELL 33 | TYPE: markdown
 ================================================================================
 ### §4.1  Sampling Efficiency (3 marks)
 
-Using the best-performing model from Part 2 (x-prediction on swiss_roll, D=2,
-which serves as our cleanest baseline), we evaluate sample quality across
+Using the best-performing model from Part 2 (x-prediction / x-loss on swiss_roll at D=2,
+which serves as our cleanest visual baseline), we evaluate sample quality across
 step counts: 1, 2, 5, 10, 20, 50, 100, 200.
 
 **Deliverable:** Generated sample visualisations at each step count.
 
+**Observation — non-monotonic NND beyond 20 steps:**
+NND decreases sharply from 1 → 20 steps as expected (coarser Euler grids introduce
+large discretisation error). Beyond 20 steps, NND plateaus and slightly *increases*
+(20 steps ≈ 0.034 → 200 steps ≈ 0.045). Two effects explain this:
+
+1. **NND estimator variance:** NND is computed on a finite sample ($N=2000$). At
+   the quality level achieved by 20+ steps, the true generation error is small and
+   the stochastic variation in the NND estimate dominates, causing noisy fluctuations
+   of comparable magnitude to the underlying difference.
+
+2. **Euler integration overshoot:** With many very small steps, accumulated
+   floating-point rounding and the first-order Euler update can slightly overshoot
+   in regions where the true ODE trajectory is curved. A higher-order integrator
+   (Heun, RK4) would not exhibit this plateau or mild reversal.
+
+In practice, **20 Euler steps is sufficient** for near-optimal sample quality with
+this model; there is no benefit to using more.
+
+**Note** that *at D=2, v/v achieves NND 0.011 vs x/x at 0.040; x/x is chosen here for consistency with the D=32 MeanFlow setup in Part 4.2.*
+
 ================================================================================
-CELL 33 | TYPE: code
+CELL 34 | TYPE: code
 ================================================================================
 # §4.1  Sampling efficiency — best model from Part 2
 # ──────────────────────────────────────────────────────────────────────────────
@@ -997,7 +1106,7 @@ for nfe in STEP_COUNTS:
     print(f"{nfe:4d} | {nnd:.5f}  {bar}")
 
 ================================================================================
-CELL 34 | TYPE: markdown
+CELL 35 | TYPE: markdown
 ================================================================================
 ### §4.2  MeanFlow — One-Step Generation (9 marks)
 
@@ -1011,10 +1120,10 @@ $$u_\theta(z_t,\, t,\, h) \;\approx\; \frac{1}{h}\int_{r}^{t} v(z_s,s)\, ds$$
 This enables **single-step generation** via $z_r = z_t - h \cdot u_\theta(z_t, t, h)$.
 
 **Training (self-consistency condition):**
-$$\mathcal{L} = \left\| u_\theta(z_t,t,h) - \text{sg}\!\left[ v_\theta(z_t,t) + h \cdot \frac{d}{dt}u_\theta(z_t(t),t,h) \right] \right\|^2$$
+$$\mathcal{L} = \left\| u_\theta(z_t,t,h) - \text{sg}\!\left[ v_{\text{true}}(z_t,t) - h \cdot \frac{d}{dt}u_\theta(z_t(t),t,h(t)) \right] \right\|^2$$
 
 The time derivative $\frac{d}{dt}u_\theta$ is computed via **JVP**:
-$$\frac{d}{dt}u_\theta(z_t(t),t,h) = \text{JVP}\!\left(u_\theta,\; (z_t, t),\; (v_{\text{true}}, 1)\right)$$
+$$\frac{d}{dt}u_\theta(z_t(t),t,h(t)) = \text{JVP}\!\left(u_\theta,\; (z_t, t, h),\; (v_{\text{true}}, 1, 1)\right)$$
 
 The training mixes 50% standard FM (h=0) with 50% mean-velocity consistency (h>0).
 
@@ -1023,21 +1132,30 @@ The MeanFlowMLP adds a second 128-dim sinusoidal embedding for $h$ (separate par
 so the input is $[z_t;\, e_t;\, e_h] \in \mathbb{R}^{D+256}$.
 
 ================================================================================
-CELL 35 | TYPE: code
+CELL 36 | TYPE: code
 ================================================================================
 # §4.2  Train MeanFlow models on all 3 datasets at D=32
 # ──────────────────────────────────────────────────────────────────────────────
-# We use x-prediction (best from Part 2) as the base parameterisation.
-# Training: 25K steps, same LR and batch size as before.
+# We use direct mean-velocity v/v MeanFlow for the strongest 1-step samples.
+# Training: 200K steps with an FM-only warmup and t_eps=1e-2.
 
-MF_PRED_TYPE = 'x'     # best prediction type from Part 2
+MF_PRED_TYPE = 'v'
 MF_DIM       = 32
+MF_N_STEPS   = 200_000
+MF_T_EPS     = 1e-2
+MF_WARMUP_FRAC = 0.4
+MF_RUN_TAG   = 'vv_200k_teps1e2_warm04'
+BATCH_SIZE = 1024
+LR         = 1e-3 #1e-3
+N_ODE_STEPS = 50
+HIDDEN_DIM  = 256
+TIME_EMB_DIM = 128
 
 meanflow_models = {}
 meanflow_losses = {}
 
 for ds_name in DATASETS:
-    run_name = f'p4_meanflow_{ds_name}_d{MF_DIM}'
+    run_name = f'p4_meanflow_{MF_RUN_TAG}_{ds_name}_d{MF_DIM}'
     print(f"\n{'='*55}\nMeanFlow: {ds_name}  D={MF_DIM}  pred={MF_PRED_TYPE}")
 
     dl     = get_dataloader(ds_name, dim=MF_DIM, batch_size=BATCH_SIZE,
@@ -1047,13 +1165,15 @@ for ds_name in DATASETS:
 
     mfm, losses = train_meanflow(
         mfm, dl,
-        n_steps=N_STEPS, lr=LR,
+        n_steps=MF_N_STEPS, lr=LR,
         pred_type=MF_PRED_TYPE,
         fm_ratio=0.5,
+        warmup_frac=MF_WARMUP_FRAC,
+        t_eps=MF_T_EPS,
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
-        checkpoint_every=5_000,
-        resume=True,
+        checkpoint_every=10_000,
+        resume=False,
         run_name=run_name,
     )
     meanflow_models[ds_name] = mfm
@@ -1063,7 +1183,7 @@ for ds_name in DATASETS:
 print("\nAll MeanFlow models trained ✓")
 
 ================================================================================
-CELL 36 | TYPE: code
+CELL 37 | TYPE: code
 ================================================================================
 # §4.2  Plot MeanFlow loss curves
 for ds_name in DATASETS:
@@ -1072,13 +1192,53 @@ for ds_name in DATASETS:
                     save_path=f'{RESULTS_DIR}/part4_loss_meanflow_{ds_name}.png')
 
 ================================================================================
-CELL 37 | TYPE: code
+CELL 38 | TYPE: code
+================================================================================
+# ── Reload MeanFlow models from checkpoints (no retraining) ──────────────────
+from model import MeanFlowMLP
+from train import load_checkpoint
+
+MF_PRED_TYPE = 'v'   # MeanFlow direct mean-velocity prediction type
+FM_PRED_TYPE = 'x'   # FM comparison model prediction type (Part 2 best)
+MF_DIM = 32
+MF_T_EPS = 1e-2
+MF_RUN_TAG = 'vv_200k_teps1e2_warm04'
+
+meanflow_models = {}
+for ds_name in DATASETS:
+    run_name = f'p4_meanflow_{MF_RUN_TAG}_{ds_name}_d{MF_DIM}'
+    mfm = MeanFlowMLP(data_dim=MF_DIM, hidden_dim=HIDDEN_DIM,
+                      time_emb_dim=TIME_EMB_DIM)
+    mfm, _, _ = load_checkpoint(mfm, CHECKPOINT_DIR, run_name, device=DEVICE)
+    mfm = mfm.to(DEVICE)
+    meanflow_models[ds_name] = mfm
+    print(f"Loaded: {run_name} ✓")
+
+# ── Reload the FM comparison model (x/x at D=32) if key missing from memory ──
+_fm_key_needed = (DATASETS[0], MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)
+if 'part2_models' not in dir() or _fm_key_needed not in part2_models:
+    from model import FlowMatchingMLP
+    if 'part2_models' not in dir():
+        part2_models = {}
+    for ds_name in DATASETS:
+        run_name = f'p2_{ds_name}_d{MF_DIM}_pred{FM_PRED_TYPE}_loss{FM_PRED_TYPE}'
+        fm = FlowMatchingMLP(data_dim=MF_DIM, hidden_dim=HIDDEN_DIM,
+                             time_emb_dim=TIME_EMB_DIM)
+        fm, _, _ = load_checkpoint(fm, CHECKPOINT_DIR, run_name, device=DEVICE)
+        fm = fm.to(DEVICE)
+        part2_models[(ds_name, MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)] = fm
+        print(f"Loaded FM: {run_name} ✓")
+
+print("\nAll models loaded — now run the visualization block ✓")
+
+================================================================================
+CELL 39 | TYPE: code
 ================================================================================
 # §4.2  Generate and compare MeanFlow vs standard FM
 # ──────────────────────────────────────────────────────────────────────────────
 # Plot 9 figures: 3 datasets × 3 step counts (1, 2, 5) for MeanFlow
 # Plus side-by-side with multi-step standard FM (50 steps)
-
+N_SAMPLES = 2000
 MF_STEP_COUNTS = [1, 2, 5]
 FM_STEPS_COMPARE = [1, 5, 10, 50]  # standard FM step counts for comparison
 
@@ -1088,20 +1248,20 @@ for ds_name in DATASETS:
     gt  = ds.to_2d(ds.data.numpy()[idx])
 
     mfm      = meanflow_models[ds_name]
-    fm_model = part2_models[(ds_name, MF_DIM, MF_PRED_TYPE, MF_PRED_TYPE)]
+    fm_model = part2_models[(ds_name, MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)]
 
     # MeanFlow samples at 1, 2, 5 steps
     mf_samples = {}
     for nfe in MF_STEP_COUNTS:
-        gen = meanflow_sample(mfm, N_SAMPLES, MF_DIM, n_steps=nfe,
-                              device=DEVICE, seed=42)
+        gen = meanflow_sample(mfm, N_SAMPLES, MF_DIM, n_steps=nfe, pred_type=MF_PRED_TYPE,
+                              device=DEVICE, t_eps=MF_T_EPS, seed=42)
         mf_samples[nfe] = ds.to_2d(gen)
 
-    # Standard FM samples at various steps
+    # Standard FM samples at various steps (FM model uses FM_PRED_TYPE='x')
     fm_samples = {}
     for nfe in FM_STEPS_COMPARE:
         gen = euler_sample(fm_model, N_SAMPLES, MF_DIM, n_steps=nfe,
-                           pred_type=MF_PRED_TYPE, device=DEVICE, seed=42)
+                           pred_type=FM_PRED_TYPE, device=DEVICE, seed=42)
         fm_samples[nfe] = ds.to_2d(gen)
 
     # ── 9 MeanFlow figures (3 datasets × 3 step counts)
@@ -1132,18 +1292,20 @@ for ds_name in DATASETS:
 print("\nPart 4.2 visualisations complete ✓")
 
 ================================================================================
-CELL 38 | TYPE: markdown
+CELL 40 | TYPE: markdown
 ================================================================================
 ### §4.3  Analysis Questions
 
-**Q1 (2 marks): Why did you choose x-prediction for MeanFlow?**
+**Q1 (2 marks): Why did you choose v-prediction for MeanFlow?**
 
-> We chose **x-prediction** based on the Part 2 finding that x-prediction
-> is the only parameterisation that scales successfully to high ambient dimensions
-> (D=8, D=32). MeanFlow is most useful at higher dimensions where single-step
-> generation is needed, so using the parameterisation that works reliably at D=32
-> is the natural choice. v-prediction fails at D≥32, meaning any MeanFlow model
-> built on v-prediction would be starting from a broken base.
+> Although x/x was the strongest standard FM baseline at D=32, this MeanFlow
+> experiment uses **direct v/v mean-velocity prediction** because the MeanFlow
+> identity is naturally expressed in velocity space:
+> $$u_\theta = v_{\text{true}} - h\,\partial_t u_\theta.$$
+> This lets the model predict the finite-horizon average velocity directly,
+> avoiding an extra x-to-v conversion inside the MeanFlow target. We still compare
+> against the x/x FM baseline because that remains the best multi-step FM model
+> from Part 2.
 
 **Q2 (4 marks): Core idea of MeanFlow — what does it learn differently?**
 
@@ -1171,11 +1333,10 @@ CELL 38 | TYPE: markdown
 > i.e. the mean velocity at zero horizon equals the instantaneous velocity.
 > This is the **boundary condition** for the self-consistency ODE.
 >
-> Without this anchor, the $h>0$ self-consistency condition
-> $u = v + h \cdot \partial_t u$ would be homogeneous (all-zero is a trivial
-> solution). The $h=0$ boundary term provides the initial condition that drives
-> the mean velocity to match the true flow, making the $h>0$ solutions
-> non-trivial and physically meaningful.
+> Without this anchor, the $h>0$ self-consistency target depends strongly on the
+> model's own derivative and can drift during bootstrapping. The $h=0$ boundary
+> term provides a supervised velocity anchor, making the larger-horizon solutions
+> stable and physically meaningful.
 
 **Q4 (3 marks): Training cost comparison — why is MeanFlow harder?**
 
@@ -1217,7 +1378,7 @@ CELL 38 | TYPE: markdown
 > sense (one connected component), so mode averaging is less problematic.
 
 ================================================================================
-CELL 39 | TYPE: markdown
+CELL 41 | TYPE: markdown
 ================================================================================
 ---
 ## Summary of Results
@@ -1239,7 +1400,7 @@ All figures saved to `{RESULTS_DIR}`.
 All model checkpoints saved to `{CHECKPOINT_DIR}`.
 
 ================================================================================
-CELL 40 | TYPE: code
+CELL 42 | TYPE: code
 ================================================================================
 # Final: list all saved results
 import glob

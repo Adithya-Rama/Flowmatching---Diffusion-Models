@@ -1,25 +1,21 @@
 """
-Sampling procedures for Flow Matching (Parts 1 – 4).
+Sampling procedures for Flow Matching (Parts 1-4).
 
-Euler ODE sampler  (Parts 1–3):
-  Start from z ~ N(0, I) at t=1, integrate backwards to t≈0
-  using the predicted velocity field.
+Euler ODE sampler (Parts 1-3):
+  Start from z ~ N(0, I) at t=1 and integrate backward to t ~= 0.
 
-MeanFlow sampler   (Part 4):
-  Uses the mean-velocity model u_θ(z, t, h) with variable step counts.
-  Model uses x-prediction: outputs x̂_θ(z_t, t, h).
-  Step formula: z_{t_next} = z*(t_next/t) + x̂*(h/t)
-
-Reference: SiT (Scalable Interpolant Transformers) for Euler ODE details.
+MeanFlow sampler (Part 4):
+  Uses a direct mean-velocity model u_theta(z, t, h). Each step jumps from
+  time t to r = t - h with z_r = z_t - h * u_theta(z_t, t, h).
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
-T_EPS: float = 1e-4   # keep t away from exact 0
+T_EPS: float = 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -41,57 +37,37 @@ def euler_sample(
     """
     Generate samples via Euler integration of the learned ODE.
 
-    The ODE is:  dz/dt = v(z, t)   integrated from t=1 to t≈0.
-    Stepping direction is backward (Δt < 0).
-
     For v-prediction:
         v = model(z, t)
     For x-prediction:
-        x̂ = model(z, t)
-        v = (z_t − x̂) / t        [from z_t = x + t·v  ⟹  v = (z_t−x)/t]
-
-    Args:
-        model     : trained FlowMatchingMLP with model(z, t) interface
-        n_samples : number of samples to generate
-        dim       : ambient data dimension D
-        n_steps   : number of Euler integration steps
-        pred_type : 'v' or 'x'
-        device    : torch device string
-        t_eps     : minimum t value (stopping point of integration)
-        seed      : optional random seed for reproducibility
-
-    Returns:
-        samples : np.ndarray of shape (n_samples, dim)
+        x_hat = model(z, t)
+        v = (z_t - x_hat) / t
     """
+    pred_type = pred_type.lower()
+    if pred_type not in {"v", "x"}:
+        raise ValueError(f"Unknown pred_type: {pred_type!r}")
+
     model.eval()
 
     if seed is not None:
         torch.manual_seed(seed)
 
-    # ── Initialise z ~ N(0, I) at t=1
     z = torch.randn(n_samples, dim, device=device)
-
-    # ── Time grid: t decreases from 1.0 to t_eps in n_steps steps
     ts = torch.linspace(1.0, t_eps, n_steps + 1, device=device)
 
     for i in range(n_steps):
         t_curr = ts[i]
         t_next = ts[i + 1]
-        dt     = t_next - t_curr          # negative (backward in time)
+        dt = t_next - t_curr
 
         t_batch = t_curr.expand(n_samples)
-        pred    = model(z, t_batch)
+        pred = model(z, t_batch)
 
         if pred_type == "v":
             v = pred
-        elif pred_type == "x":
-            # v = (z_t − x̂) / t,  guard against small t
-            t_val = float(t_curr)
-            v = (z - pred) / max(t_val, t_eps)
         else:
-            raise ValueError(f"Unknown pred_type: '{pred_type}'")
+            v = (z - pred) / max(float(t_curr), t_eps)
 
-        # Euler step:  z ← z + v · Δt
         z = z + v * dt
 
     return z.cpu().numpy()
@@ -108,72 +84,45 @@ def meanflow_sample(
     dim: int,
     *,
     n_steps: int = 1,
-    pred_type: str = "x",
+    pred_type: str = "v",
     device: str = "cpu",
     t_eps: float = T_EPS,
     seed: int | None = None,
 ) -> np.ndarray:
     """
-    Generate samples using the MeanFlow model.
+    Generate samples using a direct mean-velocity MeanFlow model.
 
-    The model uses x-prediction: model(z_t, t, h) outputs x̂_θ(z_t, t, h),
-    the predicted data endpoint over horizon h.
+    The model predicts:
+        model(z_t, t, h) -> u_theta(z_t, t, h)
 
-    Mean velocity:  u_θ = (z_t − x̂_θ) / t
-    Step update:    z_{t-h} = z_t − h · u_θ
-                            = z_t · (t_next/t) + x̂_θ · (h/t)
-
-    For 1-step (t=1, h≈1):  z_final = x̂_θ(z_noise, 1, 1)  — direct jump.
-    For k steps: each step blends current z toward x̂ by fraction h/t.
-
-    Verification (optimal straight-line flow):
-      x̂(z_t, t, h) = x for all h → z_r = z_t*(r/t) + x*(h/t)
-                                        = (x + r·v)*(r/t) + x*(h/t)  [z_t = x+t·v]
-                                        = x + r·v*(r/t) = x + r·v_true  = z_r  ✓
-
-    Args:
-        model     : trained MeanFlowMLP with model(z, t, h) interface
-        n_samples : number of samples to generate
-        dim       : ambient data dimension D
-        n_steps   : 1 (single-step) or more
-        pred_type : 'x' (default, x-prediction) or 'v' (velocity)
-        device    : torch device string
-        t_eps     : stopping time
-        seed      : optional random seed
-
-    Returns:
-        samples : np.ndarray of shape (n_samples, dim)
+    The update is:
+        z_{t-h} = z_t - h * u_theta(z_t, t, h)
     """
+    pred_type = pred_type.lower()
+    if pred_type != "v":
+        raise ValueError(
+            "MeanFlow sampler expects direct mean-velocity pred_type='v'; "
+            f"got {pred_type!r}."
+        )
+
     model.eval()
 
     if seed is not None:
         torch.manual_seed(seed)
 
-    # ── Initialise z ~ N(0, I) at t=1
     z = torch.randn(n_samples, dim, device=device)
-
-    # ── Time grid: t decreases from 1.0 to t_eps in n_steps steps
     ts = torch.linspace(1.0, t_eps, n_steps + 1, device=device)
 
     for i in range(n_steps):
         t_curr = ts[i]
         t_next = ts[i + 1]
-        h_val  = t_curr - t_next          # horizon (positive)
+        h_val = t_curr - t_next
 
         t_batch = t_curr.expand(n_samples)
         h_batch = h_val.expand(n_samples)
 
-        if pred_type == "x":
-            # model outputs x̂_θ(z_t, t, h)
-            # step: z_{t_next} = z_t*(t_next/t) + x̂*(h/t)
-            x_hat = model(z, t_batch, h_batch)
-            alpha = h_val / t_curr        # = (t - t_next) / t
-            z = z * (1.0 - alpha) + x_hat * alpha
-        else:
-            # v-prediction: model outputs mean velocity u directly
-            # step: z = z - h*u
-            u = model(z, t_batch, h_batch)
-            z = z - h_val * u
+        u = model(z, t_batch, h_batch)
+        z = z - h_val * u
 
     return z.cpu().numpy()
 
@@ -184,20 +133,18 @@ def meanflow_sample(
 
 def sample_and_project(
     model: nn.Module,
-    dataset,                 # ToyDiffusionDataset instance (for to_2d)
+    dataset,
     n_samples: int = 2000,
     *,
     n_steps: int = 50,
     pred_type: str = "v",
-    model_type: str = "fm",  # 'fm' or 'meanflow'
+    model_type: str = "fm",
     device: str = "cpu",
+    t_eps: float = T_EPS,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Sample from model and return (generated_2d, ground_truth_2d).
-
-    Works for both FlowMatchingMLP (model_type='fm') and
-    MeanFlowMLP (model_type='meanflow').
     """
     dim = dataset.dim
 
@@ -205,22 +152,22 @@ def sample_and_project(
         gen = euler_sample(
             model, n_samples, dim,
             n_steps=n_steps, pred_type=pred_type,
-            device=device, seed=seed,
+            device=device, t_eps=t_eps, seed=seed,
         )
     elif model_type == "meanflow":
         gen = meanflow_sample(
             model, n_samples, dim,
-            n_steps=n_steps, pred_type=pred_type, device=device, seed=seed,
+            n_steps=n_steps, pred_type=pred_type,
+            device=device, t_eps=t_eps, seed=seed,
         )
     else:
-        raise ValueError(f"Unknown model_type: '{model_type}'")
+        raise ValueError(f"Unknown model_type: {model_type!r}")
 
     gen_2d = dataset.to_2d(gen)
 
-    # Ground truth: random subset of training data projected to 2D
-    rng  = np.random.default_rng(0)
+    rng = np.random.default_rng(0)
     idxs = rng.choice(len(dataset), size=min(n_samples, len(dataset)), replace=False)
-    gt   = dataset.data.numpy()[idxs]
+    gt = dataset.data.numpy()[idxs]
     gt_2d = dataset.to_2d(gt)
 
     return gen_2d, gt_2d
