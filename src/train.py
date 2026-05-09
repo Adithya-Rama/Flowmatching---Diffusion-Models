@@ -260,7 +260,8 @@ def load_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"No checkpoint found at {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    state = ckpt.get("ema_shadow") or ckpt["model_state"]
+    model.load_state_dict(state)
     return model, ckpt.get("step", 0), ckpt.get("loss_history", [])
 
 
