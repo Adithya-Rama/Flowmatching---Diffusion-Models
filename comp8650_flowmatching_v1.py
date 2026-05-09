@@ -270,8 +270,8 @@ truth for all 3 datasets at D=2.
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 200_000 #25000
-LR         = 1e-2 #1e-3
+N_STEPS    = 50_000 #25000
+LR         = 1e-3 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
 TIME_EMB_DIM = 128
@@ -1068,7 +1068,7 @@ for ds_name in DATASETS:
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_every=5_000,
-        resume=True,
+        resume=False,
         run_name=run_name,
     )
     meanflow_models[ds_name] = mfm

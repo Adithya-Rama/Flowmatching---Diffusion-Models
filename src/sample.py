@@ -7,6 +7,8 @@ Euler ODE sampler  (Parts 1–3):
 
 MeanFlow sampler   (Part 4):
   Uses the mean-velocity model u_θ(z, t, h) with variable step counts.
+  Model uses x-prediction: outputs x̂_θ(z_t, t, h).
+  Step formula: z_{t_next} = z*(t_next/t) + x̂*(h/t)
 
 Reference: SiT (Scalable Interpolant Transformers) for Euler ODE details.
 """
@@ -114,23 +116,27 @@ def meanflow_sample(
     """
     Generate samples using the MeanFlow model.
 
-    MeanFlow predicts the mean velocity u_θ(z_t, t, h) over the horizon h = t − r.
-    The model outputs velocity directly for all h.
+    The model uses x-prediction: model(z_t, t, h) outputs x̂_θ(z_t, t, h),
+    the predicted data endpoint over horizon h.
 
-    For a single step: h ≈ 1, so z_0 = z_1 − 1 · u_θ(z_1, 1, 1) directly jumps
-    from near-noise to near-data in one evaluation.
+    Mean velocity:  u_θ = (z_t − x̂_θ) / t
+    Step update:    z_{t-h} = z_t − h · u_θ
+                            = z_t · (t_next/t) + x̂_θ · (h/t)
 
-    Update rule per step:
-        h    = t_curr − t_next         (current horizon)
-        u    = model(z, t_curr, h)     (mean velocity over horizon, direct output)
-        z   ← z − h · u               (jump to t_next = t_curr − h)
+    For 1-step (t=1, h≈1):  z_final = x̂_θ(z_noise, 1, 1)  — direct jump.
+    For k steps: each step blends current z toward x̂ by fraction h/t.
+
+    Verification (optimal straight-line flow):
+      x̂(z_t, t, h) = x for all h → z_r = z_t*(r/t) + x*(h/t)
+                                        = (x + r·v)*(r/t) + x*(h/t)  [z_t = x+t·v]
+                                        = x + r·v*(r/t) = x + r·v_true  = z_r  ✓
 
     Args:
         model     : trained MeanFlowMLP with model(z, t, h) interface
         n_samples : number of samples to generate
         dim       : ambient data dimension D
         n_steps   : 1 (single-step) or more
-        pred_type : unused at inference (model always outputs velocity); kept for API compat
+        pred_type : 'x' (default, x-prediction) or 'v' (velocity)
         device    : torch device string
         t_eps     : stopping time
         seed      : optional random seed
@@ -146,7 +152,7 @@ def meanflow_sample(
     # ── Initialise z ~ N(0, I) at t=1
     z = torch.randn(n_samples, dim, device=device)
 
-    # ── Time grid
+    # ── Time grid: t decreases from 1.0 to t_eps in n_steps steps
     ts = torch.linspace(1.0, t_eps, n_steps + 1, device=device)
 
     for i in range(n_steps):
@@ -157,10 +163,17 @@ def meanflow_sample(
         t_batch = t_curr.expand(n_samples)
         h_batch = h_val.expand(n_samples)
 
-        # Model outputs mean velocity u_θ(z_t, t, h) directly for all h.
-        # (pred_type only affects the FM training term; sampling is always velocity-based.)
-        u = model(z, t_batch, h_batch)
-        z = z - h_val * u   # z_{t−h} = z_t − h · u
+        if pred_type == "x":
+            # model outputs x̂_θ(z_t, t, h)
+            # step: z_{t_next} = z_t*(t_next/t) + x̂*(h/t)
+            x_hat = model(z, t_batch, h_batch)
+            alpha = h_val / t_curr        # = (t - t_next) / t
+            z = z * (1.0 - alpha) + x_hat * alpha
+        else:
+            # v-prediction: model outputs mean velocity u directly
+            # step: z = z - h*u
+            u = model(z, t_batch, h_batch)
+            z = z - h_val * u
 
     return z.cpu().numpy()
 
