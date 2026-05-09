@@ -5,8 +5,10 @@ Euler ODE sampler (Parts 1-3):
   Start from z ~ N(0, I) at t=1 and integrate backward to t ~= 0.
 
 MeanFlow sampler (Part 4):
-  Uses a direct mean-velocity model u_theta(z, t, h). Each step jumps from
-  time t to r = t - h with z_r = z_t - h * u_theta(z_t, t, h).
+  For v-prediction, uses a direct mean-velocity model u_theta(z, t, h).
+  For x-prediction, converts x_hat to u_theta = (z_t - x_hat) / t.
+  Each step jumps from time t to r = t - h with
+  z_r = z_t - h * u_theta(z_t, t, h).
 """
 
 from __future__ import annotations
@@ -90,20 +92,19 @@ def meanflow_sample(
     seed: int | None = None,
 ) -> np.ndarray:
     """
-    Generate samples using a direct mean-velocity MeanFlow model.
+    Generate samples using a MeanFlow model.
 
-    The model predicts:
+    For pred_type='v':
         model(z_t, t, h) -> u_theta(z_t, t, h)
+    For pred_type='x':
+        model(z_t, t, h) -> x_hat, then u_theta = (z_t - x_hat) / t
 
     The update is:
         z_{t-h} = z_t - h * u_theta(z_t, t, h)
     """
     pred_type = pred_type.lower()
-    if pred_type != "v":
-        raise ValueError(
-            "MeanFlow sampler expects direct mean-velocity pred_type='v'; "
-            f"got {pred_type!r}."
-        )
+    if pred_type not in {"v", "x"}:
+        raise ValueError(f"MeanFlow sampler pred_type must be 'v' or 'x'; got {pred_type!r}.")
 
     model.eval()
 
@@ -121,7 +122,11 @@ def meanflow_sample(
         t_batch = t_curr.expand(n_samples)
         h_batch = h_val.expand(n_samples)
 
-        u = model(z, t_batch, h_batch)
+        pred = model(z, t_batch, h_batch)
+        if pred_type == "v":
+            u = pred
+        else:
+            u = (z - pred) / max(float(t_curr), t_eps)
         z = z - h_val * u
 
     return z.cpu().numpy()

@@ -1,8 +1,10 @@
 """
 MeanFlow training loop (Part 4).
 
-This version uses the direct mean-velocity parameterization:
-    model(z_t, t, h) -> u_theta(z_t, t, h)
+This trainer supports two MeanFlow parameterizations:
+    pred_type='v': model(z_t, t, h) -> u_theta(z_t, t, h)
+    pred_type='x': model(z_t, t, h) -> x_hat, converted internally to
+                   u_theta = (z_t - x_hat) / t
 
 For the linear interpolant z_t = (1 - t) * x + t * eps, the instantaneous
 velocity is v_true = eps - x. MeanFlow trains a finite-horizon mean velocity
@@ -15,11 +17,11 @@ the JVP below differentiates a wrapper over (z, r, t) with tangent
 (v_true, 1, 1), but it makes the "r fixed, t moving" derivative explicit.
 
 Important training details used here:
-  - v/v direct mean velocity only.
   - Logit-normal time sampling with mean=-0.4 and std=1.0.
   - A small nonzero-horizon ratio (default 25%), so the model keeps strong
     h=0 FM boundary coverage while learning finite jumps.
-  - Adaptive per-sample loss weighting, as used by the MeanFlow reference code.
+  - Optional adaptive per-sample loss weighting.
+  - Optional x-pred initialization from the Part 2 x/x FM model.
   - EMA weights saved in checkpoints and applied to the returned model.
 """
 
@@ -42,12 +44,38 @@ T_EPS: float = 1e-4
 
 def _validate_pred_type(pred_type: str) -> str:
     pred_type = pred_type.lower()
-    if pred_type != "v":
-        raise ValueError(
-            "MeanFlow uses direct mean-velocity pred_type='v'; "
-            f"got {pred_type!r}."
-        )
+    if pred_type not in {"v", "x"}:
+        raise ValueError(f"MeanFlow pred_type must be 'v' or 'x'; got {pred_type!r}.")
     return pred_type
+
+
+def initialise_meanflow_from_fm(meanflow_model: nn.Module, fm_model: nn.Module) -> nn.Module:
+    """
+    Copy a trained FlowMatchingMLP into a MeanFlowMLP.
+
+    MeanFlow has one extra horizon embedding. The first-layer weights for
+    [z_t, e_t] are copied from the FM model, while the e_h block is zeroed.
+    Therefore the initialized MeanFlow model exactly matches the FM model and
+    initially ignores h, then finite-horizon training can learn h-dependence.
+    """
+    with torch.no_grad():
+        meanflow_model.time_embedding.load_state_dict(fm_model.time_embedding.state_dict())
+
+        fm_first = fm_model.hidden[0]
+        mf_first = meanflow_model.hidden[0]
+        copy_cols = fm_first.weight.shape[1]
+        mf_first.weight.zero_()
+        mf_first.weight[:, :copy_cols].copy_(fm_first.weight)
+        mf_first.bias.copy_(fm_first.bias)
+
+        for layer_idx in (2, 4, 6, 8):
+            meanflow_model.hidden[layer_idx].weight.copy_(fm_model.hidden[layer_idx].weight)
+            meanflow_model.hidden[layer_idx].bias.copy_(fm_model.hidden[layer_idx].bias)
+
+        meanflow_model.output_layer.weight.copy_(fm_model.output_layer.weight)
+        meanflow_model.output_layer.bias.copy_(fm_model.output_layer.bias)
+
+    return meanflow_model
 
 
 def _sample_logit_normal_times(
@@ -95,16 +123,16 @@ def meanflow_loss(
     t_eps: float = T_EPS,
 ) -> torch.Tensor:
     """
-    Compute the direct v/v MeanFlow loss.
+    Compute the MeanFlow loss.
 
     Args:
         model            : MeanFlowMLP
         x                : clean data batch, shape (B, D)
-        pred_type        : must be 'v'
+        pred_type        : 'v' for direct mean velocity, 'x' for clean endpoint
         r_neq_t_ratio    : fraction of samples with r != t; the rest are h=0 FM
         time_dist_mean   : logit-normal time mean
         time_dist_std    : logit-normal time std
-        loss_scale       : adaptive weighting exponent; 1.0 matches paper recipe
+        loss_scale       : adaptive weighting exponent; 0.0 disables it
         norm_eps         : adaptive weighting floor
         device           : torch device string
         t_eps            : time clamp floor
@@ -112,7 +140,7 @@ def meanflow_loss(
     Returns:
         scalar loss
     """
-    _validate_pred_type(pred_type)
+    pred_type = _validate_pred_type(pred_type)
 
     x = x.to(device).float()
     batch_size = x.shape[0]
@@ -134,7 +162,7 @@ def meanflow_loss(
     pred = model(z, t, h)
 
     if r_neq_t_ratio <= 0.0:
-        target = v_true
+        target = v_true if pred_type == "v" else x
     else:
         def model_u(
             z_in: torch.Tensor,
@@ -142,7 +170,10 @@ def meanflow_loss(
             t_in: torch.Tensor,
         ) -> torch.Tensor:
             h_in = (t_in - r_in).clamp_min(0.0)
-            return model(z_in, t_in, h_in)
+            out = model(z_in, t_in, h_in)
+            if pred_type == "v":
+                return out
+            return (z_in - out) / t_in.clamp_min(t_eps).view(-1, 1)
 
         zeros = torch.zeros(batch_size, device=device)
         ones = torch.ones(batch_size, device=device)
@@ -151,9 +182,15 @@ def meanflow_loss(
             (z.detach(), r.detach(), t.detach()),
             (v_true, zeros, ones),
         )
-        target = (v_true - h.view(batch_size, 1) * du_dt).detach()
+        if pred_type == "v":
+            target = (v_true - h.view(batch_size, 1) * du_dt).detach()
+        else:
+            target = (x + t.view(batch_size, 1) * h.view(batch_size, 1) * du_dt).detach()
 
-    per_sample = (pred - target).pow(2).sum(dim=1)
+    if pred_type == "v":
+        per_sample = (pred - target).pow(2).sum(dim=1)
+    else:
+        per_sample = (pred - target).pow(2).mean(dim=1)
     if loss_scale > 0.0:
         weights = 1.0 / (per_sample.detach() + norm_eps).pow(loss_scale)
         return (weights * per_sample).mean()
