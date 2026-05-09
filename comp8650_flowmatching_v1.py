@@ -54,6 +54,7 @@ print(f"Checkpoints: {CHECKPOINT_DIR}")
 print(f"Results    : {RESULTS_DIR}")
 
 import os
+import glob
 import subprocess
 
 def run(cmd, **kw):
@@ -69,29 +70,28 @@ def run(cmd, **kw):
     return result.stdout.strip()
 
 git_dir = os.path.join(REPO_DIR, ".git")
-lock_file = os.path.join(
-    git_dir,
-    "refs",
-    "remotes",
-    "origin",
-    "main.lock"
-)
 
 if not os.path.exists(git_dir):
     print("Cloning repository …")
     out = run(f'git clone {REPO_URL} "{REPO_DIR}"')
     print(out or "Done.")
 else:
-    print("Repository found — pulling latest …")
+    print("Repository found — cleaning stale locks …")
 
-    # Remove stale lock file if it exists
-    if os.path.exists(lock_file):
-        print("Removing stale git lock file …")
-        os.remove(lock_file)
+    # Remove ALL git lock files
+    lock_files = glob.glob(os.path.join(git_dir, "**", "*.lock"), recursive=True)
 
-    # Optional safety cleanup
+    for lf in lock_files:
+        try:
+            os.remove(lf)
+            print("Removed:", lf)
+        except Exception as e:
+            print("Could not remove:", lf, e)
+
+    # Repair/repack repository metadata
     run(f'git -C "{REPO_DIR}" gc --prune=now')
 
+    print("Pulling latest …")
     out = run(f'git -C "{REPO_DIR}" pull --ff-only')
     print(out)
 
@@ -179,6 +179,18 @@ DATA_PATH = Path(DATA_DIR)
 DATASETS  = ('swiss_roll', 'gaussians', 'circles')
 DIMS      = (2, 8, 32)
 
+import os
+
+print("REPO_DIR exists:", os.path.exists(REPO_DIR))
+print("SRC_DIR exists :", os.path.exists(SRC_DIR))
+
+print("\nRepo contents:")
+print(os.listdir(REPO_DIR))
+
+if os.path.exists(SRC_DIR):
+    print("\nsrc contents:")
+    print(os.listdir(SRC_DIR))
+
 """---
 ## §1  Part 1 — Warm-up (10 marks) <a id='part1'></a>
 
@@ -258,8 +270,8 @@ truth for all 3 datasets at D=2.
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 25000 #25000
-LR         = 1e-3 #1e-3
+N_STEPS    = 200_000 #25000
+LR         = 1e-2 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
 TIME_EMB_DIM = 128
@@ -1056,7 +1068,7 @@ for ds_name in DATASETS:
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_every=5_000,
-        resume=False,
+        resume=True,
         run_name=run_name,
     )
     meanflow_models[ds_name] = mfm

@@ -4,47 +4,29 @@ MeanFlow training loop (Part 4).
 MeanFlow (arXiv 2505.13447) trains a model to predict the *mean velocity*
 u_θ(z_t, t, h) over a time horizon h = t − r.
 
-Key idea
-────────
-Standard flow matching predicts the instantaneous velocity v(z_t, t) and
-requires many ODE steps at inference.  MeanFlow instead predicts the
-average velocity over an entire horizon, enabling single-step generation
-via  z_r = z_t − h · u_θ(z_t, t, h).
+The model ALWAYS outputs mean velocity (not x̂). pred_type only controls
+how the FM boundary condition target is computed.
 
 Training objective
 ──────────────────
 Two terms are mixed in each mini-batch (split controlled by `fm_ratio`):
 
 1. Standard FM term  (h = 0, 50 % of batch by default)
-   Enforces  u_θ(z_t, t, 0) = v(z_t, t)  via the same MSE loss as Part 1.
+   Enforces  u_θ(z_t, t, 0) = v(z_t, t):
+     - x-pred:  v_target = (z_t − x) / t
+     - v-pred:  v_target = ε − x
 
 2. Mean-velocity consistency term  (h > 0, remaining 50 %)
-   Uses the self-consistency condition (Eq. 4 of the MeanFlow paper):
+   Self-consistency condition (Eq. 3 of the MeanFlow paper):
 
-       u_θ(z_t, t, h)  ≈  sg[ v_θ(z_t, t)  +  h · (∂/∂t + v·∇_z) u_θ ]
+       u_θ(z_t, t, h) = sg[ v_θ(z_t, t) + h · D_t u_θ(z_t, t, h) ]
 
-   where  sg(·)  is stop-gradient and the material derivative
-   (∂/∂t + v·∇_z) u_θ  is computed via  torch.func.jvp  along the
-   tangent vector  (dz_t/dt, dt/dt) = (v_true, 1).
-
-JVP details
-───────────
-Given the forward process  z_t = x + t · v_true  with  v_true = ε − x:
-
-   d/dt  u_θ(z_t(t), t, h)   (material derivative, h fixed)
-     = JVP of  λ(t) = u_θ(z_t(t), t, h)
-       with primals  (t, z_t)  and tangents  (1, v_true).
-
-This is precisely what  torch.func.jvp  computes:
-
-   _, du_dt = torch.func.jvp(
-       lambda t_in, z_in: model(z_in, t_in, h),
-       (t, z_t),
-       (ones, v_true),
-   )
-
-where `ones` is a vector of 1s (tangent for t) and `v_true` is the true
-velocity tangent for z_t.
+   where:
+     - v_θ(z_t, t) = u_θ(z_t, t, 0)   (model's own h=0 prediction)
+     - D_t u_θ = total time derivative along the ODE trajectory
+               = JVP(u_θ(·, ·, h), (z_t, t), (v_true, 1))
+               with tangents (dz/dt, dt/dt) = (v_true, 1)
+     - sg(·) = stop-gradient (detach)
 """
 
 from __future__ import annotations
@@ -53,6 +35,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -75,12 +58,13 @@ def meanflow_loss(
     x    = x.to(device).float()
     B, D = x.shape
 
-    split    = max(1, int(B * fm_ratio))
-    mv_start = split
-    losses   = []
+    split  = max(1, int(B * fm_ratio))
+    losses = []
 
     # ══════════════════════════════════════════════════════════════════════
-    # 1.  Standard Flow Matching  (h = 0)
+    # 1.  Standard FM term  (h = 0)
+    #     Enforces boundary condition: u_θ(z_t, t, 0) = v(z_t, t)
+    #     Model output = mean velocity; target = instantaneous velocity.
     # ══════════════════════════════════════════════════════════════════════
     x_fm   = x[:split]
     B_fm   = x_fm.shape[0]
@@ -90,16 +74,22 @@ def meanflow_loss(
     z_fm   = (1.0 - t4_fm) * x_fm + t4_fm * eps_fm
     h_zero = torch.zeros(B_fm, device=device)
 
-    pred_fm   = model(z_fm, t_fm, h_zero)
-    target_fm = x_fm if pred_type == "x" else (eps_fm - x_fm)
-    loss_fm   = nn.functional.mse_loss(pred_fm, target_fm)
+    pred_fm = model(z_fm, t_fm, h_zero)
+    if pred_type == "x":
+        v_target_fm = (z_fm - x_fm) / t4_fm   # v = (z_t − x) / t
+    else:
+        v_target_fm = eps_fm - x_fm            # v = ε − x
+    loss_fm = F.mse_loss(pred_fm, v_target_fm)
     losses.append(loss_fm)
 
     # ══════════════════════════════════════════════════════════════════════
-    # 2.  Mean-velocity consistency  (h > 0)
+    # 2.  Mean-velocity consistency term  (h > 0)
+    #     Self-consistency: u_θ(z_t, t, h) = sg[ v_θ(z_t,t) + h·D_t u_θ ]
+    #     D_t u_θ = JVP of u_θ(z_t(t), t, h) w.r.t. (z_t, t)
+    #              with tangents (v_true, 1)  — total time derivative
     # ══════════════════════════════════════════════════════════════════════
     if B - split > 0:
-        x_mv   = x[mv_start:]
+        x_mv   = x[split:]
         B_mv   = x_mv.shape[0]
         eps_mv = torch.randn_like(x_mv)
         r_mv   = torch.rand(B_mv, device=device).clamp(t_eps, 1.0 - t_eps)
@@ -110,31 +100,47 @@ def meanflow_loss(
         z_mv   = (1.0 - t4_mv) * x_mv + t4_mv * eps_mv
 
         try:
-            ones_h = torch.ones_like(h_mv)
+            # Prediction at h>0 — kept in graph for backward
+            u_pred = model(z_mv, t_mv, h_mv)
 
-            def _model_fn_h(h_in):
-                return model(z_mv, t_mv, h_in)  # z,t fixed; differentiate w.r.t. h only
+            # Instantaneous velocity at h=0: v_θ(z_t, t) = u_θ(z_t, t, 0)
+            # Goes into target → stop-gradient via no_grad
+            h_zero_mv = torch.zeros(B_mv, device=device)
+            with torch.no_grad():
+                v_hat_0 = model(z_mv, t_mv, h_zero_mv)
 
-            with torch.enable_grad():
-                pred_h, dpred_dh = torch.func.jvp(
-                    _model_fn_h, (h_mv,), (ones_h,)
-                )
+            # True velocity tangent dz_t/dt = v = ε − x
+            if pred_type == "x":
+                v_tan = (z_mv - x_mv) / t4_mv
+            else:
+                v_tan = eps_mv - x_mv
 
-            # MeanFlow identity:  x̂_h + h·(∂x̂/∂h) = x
-            # Enforce directly against true x — NO stop-gradient, NO pred_0.
-            # The only finite solution to this ODE is x̂(h) = x for all h.
-            # This has NO degenerate fixed point: if model ignores h,
-            # loss = MSE(x̂(z,t), x) = FM loss ≠ 0, so it cannot cheat.
-            h4            = h_mv.view(B_mv, 1)
-            consistency   = pred_h + h4 * dpred_dh   # must equal x_mv
-            target_mv     = x_mv if pred_type == "x" else (eps_mv - x_mv)
-            loss_mv       = nn.functional.mse_loss(consistency, target_mv)
+            # JVP: D_t u_θ(z_t(t), t, h) with h fixed
+            # Differentiate w.r.t. (z_t, t), tangents = (v_tan, 1)
+            h_mv_d  = h_mv.detach()
+            z_mv_d  = z_mv.detach()
+            t_mv_d  = t_mv.detach()
+            v_tan_d = v_tan.detach()
+            ones_t  = torch.ones(B_mv, device=device)
+
+            def _fn(z_in, t_in):
+                return model(z_in, t_in, h_mv_d)
+
+            _, du_dt = torch.func.jvp(_fn, (z_mv_d, t_mv_d), (v_tan_d, ones_t))
+
+            # Target: sg[ v_θ(z_t, t) + h · D_t u_θ ]
+            h4     = h_mv.view(B_mv, 1)
+            target = (v_hat_0 + h4 * du_dt.detach()).detach()
+            loss_mv = F.mse_loss(u_pred, target)
 
         except Exception as _e:
             tqdm.write(f"[MeanFlow] JVP fallback: {_e}")
-            pred_fallback = model(z_mv, t_mv, h_mv)
-            target_fb     = x_mv if pred_type == "x" else (eps_mv - x_mv)
-            loss_mv       = nn.functional.mse_loss(pred_fallback, target_fb)
+            pred_fb = model(z_mv, t_mv, h_mv)
+            if pred_type == "x":
+                v_fb = (z_mv - x_mv) / t4_mv
+            else:
+                v_fb = eps_mv - x_mv
+            loss_mv = F.mse_loss(pred_fb, v_fb)
 
         losses.append(loss_mv)
 

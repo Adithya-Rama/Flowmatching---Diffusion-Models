@@ -115,14 +115,14 @@ def meanflow_sample(
     Generate samples using the MeanFlow model.
 
     MeanFlow predicts the mean velocity u_θ(z_t, t, h) over the horizon h = t − r.
-    For a single step: h = 1 − t_eps ≈ 1, so z_r = z_t − h · u_θ directly jumps
-    from near-noise to near-data.
+    The model outputs velocity directly for all h.
 
-    For multi-step (n_steps > 1), the horizon shrinks proportionally.
+    For a single step: h ≈ 1, so z_0 = z_1 − 1 · u_θ(z_1, 1, 1) directly jumps
+    from near-noise to near-data in one evaluation.
 
     Update rule per step:
         h    = t_curr − t_next         (current horizon)
-        u    = model(z, t_curr, h)     (mean velocity over horizon)
+        u    = model(z, t_curr, h)     (mean velocity over horizon, direct output)
         z   ← z − h · u               (jump to t_next = t_curr − h)
 
     Args:
@@ -130,6 +130,7 @@ def meanflow_sample(
         n_samples : number of samples to generate
         dim       : ambient data dimension D
         n_steps   : 1 (single-step) or more
+        pred_type : unused at inference (model always outputs velocity); kept for API compat
         device    : torch device string
         t_eps     : stopping time
         seed      : optional random seed
@@ -156,22 +157,10 @@ def meanflow_sample(
         t_batch = t_curr.expand(n_samples)
         h_batch = h_val.expand(n_samples)
 
-        # # u_θ(z_t, t, h) — mean velocity over the horizon [t−h, t]
-        # u = model(z, t_batch, h_batch)
-
-        # # Jump:  z_{t−h} = z_t − h · u
-        # z = z - h_val * u
-        x_hat = model(z, t_batch, h_batch)  # model outputs x̂
-
-        if pred_type == 'x':
-            # Convert x̂ → mean velocity: u = (z − x̂) / t
-            t_val = float(t_curr)
-            u = (z - x_hat) / max(t_val, t_eps)
-        else:
-            u = x_hat  # model directly outputs velocity (v-prediction)
-
-        z = z - h_val * u   # MeanFlow step: z_{t-h} = z_t - h·u
-        # Equivalently: z = z*(1 - h/t) + x_hat*(h/t)  for x-prediction
+        # Model outputs mean velocity u_θ(z_t, t, h) directly for all h.
+        # (pred_type only affects the FM training term; sampling is always velocity-based.)
+        u = model(z, t_batch, h_batch)
+        z = z - h_val * u   # z_{t−h} = z_t − h · u
 
     return z.cpu().numpy()
 
