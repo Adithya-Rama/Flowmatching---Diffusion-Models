@@ -1042,12 +1042,12 @@ so the input is $[z_t;\, e_t;\, e_h] \in \mathbb{R}^{D+256}$.
 
 # §4.2  Train MeanFlow models on all 3 datasets at D=32
 # ──────────────────────────────────────────────────────────────────────────────
-# v-prediction: simpler JVP (no 1/t division), more stable MV consistency.
-# 200k steps: 80k warmup (pure FM) + 120k MV consistency.
+# x-prediction (best from Part 2). MV consistency target uses ground-truth
+# v_true (paper Eq. 11), not the model's own h=0 prediction.
 
-MF_PRED_TYPE = 'v'
+MF_PRED_TYPE = 'x'
 MF_DIM       = 32
-MF_N_STEPS   = 200_000
+MF_N_STEPS   = 25_000
 
 meanflow_models = {}
 meanflow_losses = {}
@@ -1066,11 +1066,9 @@ for ds_name in DATASETS:
         n_steps=MF_N_STEPS, lr=LR,
         pred_type=MF_PRED_TYPE,
         fm_ratio=0.5,
-        warmup_frac=0.4,
-        t_eps=1e-2,
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
-        checkpoint_every=10_000,
+        checkpoint_every=5_000,
         resume=False,
         run_name=run_name,
     )
@@ -1090,7 +1088,8 @@ for ds_name in DATASETS:
 from model import MeanFlowMLP
 from train import load_checkpoint
 
-MF_PRED_TYPE = 'v'
+MF_PRED_TYPE = 'x'   # MeanFlow uses Part 2's best (x-prediction)
+FM_PRED_TYPE = 'x'   # FM comparison model uses same (Part 2 best)
 MF_DIM = 32
 
 meanflow_models = {}
@@ -1103,18 +1102,19 @@ for ds_name in DATASETS:
     meanflow_models[ds_name] = mfm
     print(f"Loaded: {run_name} ✓")
 
-# ── Also reload the FM comparison model (x/x at D=32) if not in memory ───────
-# Only needed if part2_models dict is gone from memory
-if 'part2_models' not in dir() or not part2_models:
+# ── Reload the FM comparison model (x/x at D=32) if key missing from memory ──
+_fm_key_needed = (DATASETS[0], MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)
+if 'part2_models' not in dir() or _fm_key_needed not in part2_models:
     from model import FlowMatchingMLP
-    part2_models = {}
+    if 'part2_models' not in dir():
+        part2_models = {}
     for ds_name in DATASETS:
-        run_name = f'p2_{ds_name}_d{MF_DIM}_predx_lossx'
+        run_name = f'p2_{ds_name}_d{MF_DIM}_pred{FM_PRED_TYPE}_loss{FM_PRED_TYPE}'
         fm = FlowMatchingMLP(data_dim=MF_DIM, hidden_dim=HIDDEN_DIM,
                              time_emb_dim=TIME_EMB_DIM)
         fm, _, _ = load_checkpoint(fm, CHECKPOINT_DIR, run_name, device=DEVICE)
         fm = fm.to(DEVICE)
-        part2_models[(ds_name, MF_DIM, MF_PRED_TYPE, MF_PRED_TYPE)] = fm
+        part2_models[(ds_name, MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)] = fm
         print(f"Loaded FM: {run_name} ✓")
 
 print("\nAll models loaded — now run the visualization block ✓")
@@ -1133,7 +1133,7 @@ for ds_name in DATASETS:
     gt  = ds.to_2d(ds.data.numpy()[idx])
 
     mfm      = meanflow_models[ds_name]
-    fm_model = part2_models[(ds_name, MF_DIM, MF_PRED_TYPE, MF_PRED_TYPE)]
+    fm_model = part2_models[(ds_name, MF_DIM, FM_PRED_TYPE, FM_PRED_TYPE)]
 
     # MeanFlow samples at 1, 2, 5 steps
     mf_samples = {}
@@ -1142,11 +1142,11 @@ for ds_name in DATASETS:
                               device=DEVICE, seed=42)
         mf_samples[nfe] = ds.to_2d(gen)
 
-    # Standard FM samples at various steps
+    # Standard FM samples at various steps (FM model uses FM_PRED_TYPE='x')
     fm_samples = {}
     for nfe in FM_STEPS_COMPARE:
         gen = euler_sample(fm_model, N_SAMPLES, MF_DIM, n_steps=nfe,
-                           pred_type=MF_PRED_TYPE, device=DEVICE, seed=42)
+                           pred_type=FM_PRED_TYPE, device=DEVICE, seed=42)
         fm_samples[nfe] = ds.to_2d(gen)
 
     # ── 9 MeanFlow figures (3 datasets × 3 step counts)
