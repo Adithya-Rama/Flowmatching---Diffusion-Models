@@ -270,7 +270,7 @@ truth for all 3 datasets at D=2.
 # §1.2  Hyperparameters (reported here for the assignment)
 # ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE = 1024
-N_STEPS    = 50_000 #25000
+N_STEPS    = 25_000
 LR         = 1e-3 #1e-3
 N_ODE_STEPS = 50
 HIDDEN_DIM  = 256
@@ -1042,11 +1042,12 @@ so the input is $[z_t;\, e_t;\, e_h] \in \mathbb{R}^{D+256}$.
 
 # §4.2  Train MeanFlow models on all 3 datasets at D=32
 # ──────────────────────────────────────────────────────────────────────────────
-# We use x-prediction (best from Part 2) as the base parameterisation.
-# Training: 25K steps, same LR and batch size as before.
+# v-prediction: simpler JVP (no 1/t division), more stable MV consistency.
+# 200k steps: 80k warmup (pure FM) + 120k MV consistency.
 
-MF_PRED_TYPE = 'x'     # best prediction type from Part 2
+MF_PRED_TYPE = 'v'
 MF_DIM       = 32
+MF_N_STEPS   = 200_000
 
 meanflow_models = {}
 meanflow_losses = {}
@@ -1062,12 +1063,14 @@ for ds_name in DATASETS:
 
     mfm, losses = train_meanflow(
         mfm, dl,
-        n_steps=N_STEPS, lr=LR,
+        n_steps=MF_N_STEPS, lr=LR,
         pred_type=MF_PRED_TYPE,
         fm_ratio=0.5,
+        warmup_frac=0.4,
+        t_eps=1e-2,
         device=DEVICE,
         checkpoint_dir=CHECKPOINT_DIR,
-        checkpoint_every=5_000,
+        checkpoint_every=10_000,
         resume=False,
         run_name=run_name,
     )
@@ -1087,7 +1090,7 @@ for ds_name in DATASETS:
 from model import MeanFlowMLP
 from train import load_checkpoint
 
-MF_PRED_TYPE = 'x'
+MF_PRED_TYPE = 'v'
 MF_DIM = 32
 
 meanflow_models = {}

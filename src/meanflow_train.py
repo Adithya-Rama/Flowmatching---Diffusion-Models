@@ -171,6 +171,8 @@ def train_meanflow(
     lr: float = 1e-3,
     pred_type: str = "x",
     fm_ratio: float = 0.5,
+    warmup_frac: float = 0.0,
+    t_eps: float = T_EPS,
     device: str = "cpu",
     checkpoint_dir: str | Path | None = None,
     checkpoint_every: int = 5_000,
@@ -186,8 +188,11 @@ def train_meanflow(
         dataloader      : DataLoader over ToyDiffusionDataset
         n_steps         : total gradient steps
         lr              : Adam learning rate
-        pred_type       : best prediction type from Part 2 (default 'x')
-        fm_ratio        : fraction of each batch for standard FM (h=0)
+        pred_type       : 'v' or 'x'
+        fm_ratio        : fraction of each batch for standard FM (h=0) after warmup
+        warmup_frac     : fraction of steps to train FM-only before MV consistency;
+                          e.g. 0.4 means first 40% of steps use fm_ratio=1.0
+        t_eps           : clamp t to [t_eps, 1-t_eps] for numerical stability
         device          : torch device
         checkpoint_dir  : directory for saving checkpoints
         checkpoint_every: save frequency in steps
@@ -203,6 +208,7 @@ def train_meanflow(
 
     start_step: int = 0
     loss_history: list[float] = []
+    warmup_steps = int(n_steps * warmup_frac)
 
     # ── Resume ───────────────────────────────────────────────────────────
     if checkpoint_dir is not None:
@@ -238,11 +244,15 @@ def train_meanflow(
             data_iter = iter(dataloader)
             x = next(data_iter)
 
+        # Pure FM warmup: ignore h-dependence until FM sub-term has converged
+        current_fm_ratio = 1.0 if step < warmup_steps else fm_ratio
+
         optimizer.zero_grad()
         loss = meanflow_loss(
             model, x,
             pred_type=pred_type,
-            fm_ratio=fm_ratio,
+            fm_ratio=current_fm_ratio,
+            t_eps=t_eps,
             device=device,
         )
         loss.backward()
