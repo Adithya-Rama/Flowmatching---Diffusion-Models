@@ -246,7 +246,7 @@ def train_meanflow(
             device=device,
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # add this
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
         lv = loss.item()
